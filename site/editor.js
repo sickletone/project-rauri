@@ -36,6 +36,17 @@
 
   const elementsLayer = document.getElementById("elements");
   const artboard = document.getElementById("artboard");
+
+  function updateCanvasScale() {
+    const scale = artboard.clientWidth / WIDTH;
+    elementsLayer.style.transform = `scale(${scale})`;
+  }
+
+  if ("ResizeObserver" in window) {
+    new ResizeObserver(updateCanvasScale).observe(artboard);
+  } else {
+    window.addEventListener("resize", updateCanvasScale);
+  }
   const layersList = document.getElementById("layers");
   const layerCount = document.getElementById("layer-count");
   const fields = document.getElementById("inspector-fields");
@@ -225,7 +236,7 @@
     }
 
     const before = snapshot();
-    const bounds = artboard.getBoundingClientRect();
+    const bounds = elementsLayer.getBoundingClientRect();
     const scaleX = WIDTH / bounds.width;
     const scaleY = HEIGHT / bounds.height;
     const startX = event.clientX;
@@ -825,4 +836,5 @@
 
   titleInput.value = state.title;
   render();
+  updateCanvasScale();
 })();
