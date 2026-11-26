@@ -109,6 +109,13 @@ local function naturalContentWidth(node, style, computed, maxWidth)
 	if node.attrs and node.attrs["data-icon"] then
 		return math.min(style.fontSize, maxWidth)
 	end
+	if node.tag == "canvas" then
+		return math.min(tonumber(node.attrs and node.attrs.width) or 300, maxWidth)
+	elseif node.tag == "video" then
+		return math.min(tonumber(node.attrs and node.attrs.width) or 320, maxWidth)
+	elseif node.tag == "audio" then
+		return math.min(120, maxWidth)
+	end
 	local inner = 0
 	for _, child in node.children do
 		if child.type == "element" then
@@ -142,6 +149,13 @@ local function intrinsicContentWidth(node, style, computed, maxWidth)
 	end
 	if node.attrs and node.attrs["data-icon"] then
 		return math.min(style.fontSize, maxWidth)
+	end
+	if node.tag == "canvas" then
+		return math.min(tonumber(node.attrs and node.attrs.width) or 300, maxWidth)
+	elseif node.tag == "video" then
+		return math.min(tonumber(node.attrs and node.attrs.width) or 320, maxWidth)
+	elseif node.tag == "audio" then
+		return math.min(120, maxWidth)
 	end
 	local inner = 0
 	for _, child in node.children do
@@ -193,9 +207,18 @@ end
 
 local layoutElement
 local computedRef
+local viewportWidth = 0
+local viewportHeight = 0
 
 local function visibleEntries(node, computed)
 	local entries = {}
+	local before = computed[node.id .. "::before"]
+	if before and before.content and before.content ~= "" then
+		entries[#entries + 1] = {
+			child = { type = "text", text = before.content, id = node.id .. "-before" },
+			style = before,
+		}
+	end
 	for _, child in node.children do
 		if child.type == "element" then
 			local style = computed[child.id]
@@ -208,6 +231,13 @@ local function visibleEntries(node, computed)
 				entries[#entries + 1] = { child = child, style = nil }
 			end
 		end
+	end
+	local after = computed[node.id .. "::after"]
+	if after and after.content and after.content ~= "" then
+		entries[#entries + 1] = {
+			child = { type = "text", text = after.content, id = node.id .. "-after" },
+			style = after,
+		}
 	end
 	return entries
 end
@@ -224,7 +254,7 @@ end
 local function layoutInline(entries, containerStyle, computed, contentX, contentY, contentWidth)
 	local allText = true
 	for _, entry in entries do
-		if entry.child.type ~= "text" then
+		if entry.child.type ~= "text" or entry.style then
 			allText = false
 			break
 		end
@@ -262,11 +292,13 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 		if child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				local shown = displayText(text, containerStyle)
-				local width, height = measure(shown, containerStyle, 1e6)
+				local textStyle = entry.style or containerStyle
+				local shown = displayText(text, textStyle)
+				local width, height = measure(shown, textStyle, 1e6)
 				items[#items + 1] = {
 					kind = "text",
 					node = child,
+					style = textStyle,
 					text = shown,
 					width = width,
 					height = height,
@@ -333,7 +365,7 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 			if item.kind == "text" then
 				boxes[#boxes + 1] = textBox(
 					item.node,
-					containerStyle,
+					item.style or containerStyle,
 					contentX + offset,
 					contentY + cursorY,
 					item.width,
@@ -682,78 +714,175 @@ end
 local function layoutGrid(node, entries, style, computed, contentX, contentY, contentWidth, contentHeight)
 	local gap = Css.resolve(style.gap, contentWidth, 0) or 0
 	local columns = resolveTracks(style.gridTemplateColumns, contentWidth, gap)
-	local absolute = {}
-	local flow = {}
+	local columnCount = math.max(1, #columns)
+	local absolute, fixed, flow = {}, {}, {}
 	for _, entry in entries do
-		if entry.child.type == "element" and entry.style.position == "absolute" then
+		local child = entry.child
+		if child.type == "element" and entry.style.position == "fixed" then
+			fixed[#fixed + 1] = entry
+		elseif child.type == "element" and entry.style.position == "absolute" then
 			absolute[#absolute + 1] = entry
-		elseif entry.child.type == "element" and entry.child.tag == "br" then
+		elseif child.type == "element" and child.tag == "br" then
 			-- ignore
-		elseif entry.child.type == "text" and normalizeText(entry.child.text) == "" then
+		elseif child.type == "text" and normalizeText(child.text) == "" then
 			-- whitespace between cells is not a grid item
 		else
 			flow[#flow + 1] = entry
 		end
 	end
 
-	local rows = {}
-	local cursor = 1
-	while cursor <= #flow do
-		local row = {}
-		local height = 0
-		for column = 1, #columns do
-			local entry = flow[cursor]
-			if not entry then
-				break
-			end
-			cursor += 1
-			local child = entry.child
-			local childStyle = entry.style
-			if child.type == "text" then
-				local text = normalizeText(child.text)
-				if text ~= "" then
-					local shown = displayText(text, style)
-					local width, measured = measure(shown, style, columns[column])
-					row[#row + 1] = { kind = "text", node = child, style = style, text = shown, width = math.min(width, columns[column]), height = measured, column = column }
-					height = math.max(height, measured)
+	local placements = {}
+	local occupied = {}
+	local row, column = 1, 1
+	local function canPlace(atRow, atColumn, spanX, spanY)
+		if atColumn + spanX - 1 > columnCount then
+			return false
+		end
+		for checkRow = atRow, atRow + spanY - 1 do
+			for checkColumn = atColumn, atColumn + spanX - 1 do
+				if occupied[checkRow] and occupied[checkRow][checkColumn] then
+					return false
 				end
-			else
-				local width = Css.resolve(childStyle.width, columns[column], nil) or columns[column]
-				local box = layoutElement(child, childStyle, 0, 0, width, nil, width, nil)
-				row[#row + 1] = { kind = "element", box = box, width = width, height = box.height, column = column }
-				height = math.max(height, box.height)
 			end
 		end
-		rows[#rows + 1] = { items = row, height = height }
+		return true
+	end
+
+	for _, entry in flow do
+		local child = entry.child
+		local childStyle = entry.style
+		local spanX, spanY = 1, 1
+		if child.type == "element" then
+			spanX = math.max(1, math.min(columnCount, childStyle.gridColumnSpan or 1))
+			spanY = math.max(1, childStyle.gridRowSpan or 1)
+		end
+		while not canPlace(row, column, spanX, spanY) do
+			column += 1
+			if column + spanX - 1 > columnCount then
+				column = 1
+				row += 1
+			end
+		end
+		placements[#placements + 1] = {
+			entry = entry,
+			row = row,
+			column = column,
+			spanX = spanX,
+			spanY = spanY,
+		}
+		for markRow = row, row + spanY - 1 do
+			occupied[markRow] = occupied[markRow] or {}
+			for markColumn = column, column + spanX - 1 do
+				occupied[markRow][markColumn] = true
+			end
+		end
+		column += spanX
+		if column > columnCount then
+			column = 1
+			row += 1
+		end
+	end
+
+	local columnOffsets = {}
+	local offset = 0
+	for index = 1, columnCount do
+		columnOffsets[index] = offset
+		offset += columns[index] + gap
+	end
+
+	local function spanWidth(placement)
+		local first = placement.column
+		local last = placement.column + placement.spanX - 1
+		return columnOffsets[last] + columns[last] - columnOffsets[first] + gap * (placement.spanX - 1)
+	end
+
+	local rowCount = 1
+	for _, placement in placements do
+		rowCount = math.max(rowCount, placement.row + placement.spanY - 1)
+	end
+	local rowHeights = {}
+	for index = 1, rowCount do
+		rowHeights[index] = 0
+	end
+
+	for _, placement in placements do
+		local entry = placement.entry
+		local child, childStyle = entry.child, entry.style
+		local width = spanWidth(placement)
+		if child.type == "text" then
+			local textStyle = childStyle or style
+			local shown = displayText(normalizeText(child.text), textStyle)
+			local _, measured = measure(shown, textStyle, width)
+			placement.text = shown
+			placement.textStyle = textStyle
+			placement.width = width
+			placement.height = measured
+		else
+			local explicit = Css.resolve(childStyle.width, width, nil)
+			local itemWidth = explicit or width
+			local box = layoutElement(child, childStyle, 0, 0, itemWidth, nil, itemWidth, nil)
+			placement.box = box
+			placement.width = itemWidth
+			placement.height = box.height
+			if childStyle.position == "sticky" then
+				local top = Css.resolve(childStyle.top, contentHeight, nil)
+				local left = Css.resolve(childStyle.left, itemWidth, nil)
+				placement.stickyX = left or 0
+				placement.stickyY = top or 0
+			end
+		end
+		if placement.spanY == 1 and placement.height > rowHeights[placement.row] then
+			rowHeights[placement.row] = placement.height
+		end
+	end
+	for _, placement in placements do
+		if placement.spanY > 1 then
+			local first = placement.row
+			local last = placement.row + placement.spanY - 1
+			local available = gap * (placement.spanY - 1)
+			for index = first, last do
+				available += rowHeights[index]
+			end
+			if available < placement.height then
+				rowHeights[last] += placement.height - available
+			end
+		end
+	end
+
+	local rowOffsets = {}
+	offset = 0
+	for index = 1, rowCount do
+		rowOffsets[index] = offset
+		offset += rowHeights[index] + gap
 	end
 
 	local boxes = {}
-	local y = 0
-	for index, row in rows do
-		local rowHeight = row.height
-		local explicit = style.gridTemplateRows and style.gridTemplateRows[index]
-		if explicit then
-			local size = Css.resolve(explicit.length, contentHeight, rowHeight) or rowHeight
-			rowHeight = math.max(rowHeight, size)
-		end
-		local x = 0
-		for _, cell in row.items do
-			if cell.kind == "text" then
-				boxes[#boxes + 1] = textBox(cell.node, cell.style, contentX + x, contentY + y, cell.width, cell.height, cell.text)
-			else
-				local box = cell.box
-				if math.abs(box.height - rowHeight) > 0.01 and Css.resolve(box.style.height, contentHeight, nil) == nil then
-					box = layoutElement(box.node, box.style, 0, 0, cell.width, rowHeight, cell.width, rowHeight)
-				end
-				shiftBox(box, contentX + x, contentY + y)
-				boxes[#boxes + 1] = box
+	for _, placement in placements do
+		local x = contentX + columnOffsets[placement.column] + (placement.stickyX or 0)
+		local y = contentY + rowOffsets[placement.row] + (placement.stickyY or 0)
+		if placement.box then
+			local box = placement.box
+			local cellHeight = rowHeights[placement.row]
+			if placement.spanY > 1 then
+				local last = placement.row + placement.spanY - 1
+				cellHeight = rowOffsets[last] + rowHeights[last] - rowOffsets[placement.row]
 			end
-			x += columns[cell.column] + gap
+			if math.abs(box.height - cellHeight) > 0.01 and Css.resolve(box.style.height, cellHeight, nil) == nil then
+				box = layoutElement(box.node, box.style, 0, 0, placement.width, cellHeight, placement.width, cellHeight)
+				placement.box = box
+			end
+			shiftBox(box, x, y)
+			boxes[#boxes + 1] = box
+		else
+			boxes[#boxes + 1] = textBox(placement.entry.child, placement.textStyle, x, y, placement.width, placement.height, placement.text)
 		end
-		y += rowHeight + gap
 	end
 
-	return boxes, math.max(0, y - gap), absolute
+	local totalHeight = 0
+	if rowCount > 0 then
+		totalHeight = rowOffsets[rowCount] + rowHeights[rowCount]
+	end
+	return boxes, totalHeight, absolute, fixed
 end
 
 -- Block flow -------------------------------------------------------------
@@ -761,6 +890,7 @@ end
 local function layoutBlock(entries, containerStyle, computed, contentX, contentY, contentWidth, contentHeightAvailable)
 	local boxes = {}
 	local absolute = {}
+	local fixed = {}
 	local cursorY = 0
 
 	for _, entry in entries do
@@ -768,16 +898,28 @@ local function layoutBlock(entries, containerStyle, computed, contentX, contentY
 		if child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				local shown = displayText(text, containerStyle)
-				local limit = containerStyle.whiteSpace == "nowrap" and 1e6 or contentWidth
-				local width, height = measure(shown, containerStyle, limit)
-				boxes[#boxes + 1] = textBox(child, containerStyle, contentX, contentY + cursorY, width, height, shown)
+				local textStyle = entry.style or containerStyle
+				local shown = displayText(text, textStyle)
+				local limit = textStyle.whiteSpace == "nowrap" and 1e6 or contentWidth
+				local width, height = measure(shown, textStyle, limit)
+				boxes[#boxes + 1] = textBox(child, textStyle, contentX, contentY + cursorY, width, height, shown)
 				cursorY += height
 			end
 		elseif child.tag == "br" then
 			cursorY += containerStyle.fontSize * (containerStyle.lineHeight or 1.3)
+		elseif childStyle.position == "fixed" then
+			fixed[#fixed + 1] = entry
 		elseif childStyle.position == "absolute" then
 			absolute[#absolute + 1] = entry
+		elseif childStyle.float == "left" or childStyle.float == "right" then
+			-- Floats sit on the current line at the chosen edge; following block
+			-- content continues below them (text does not wrap around floats).
+			local width = Css.resolve(childStyle.width, contentWidth, nil)
+				or math.min(contentWidth, naturalContentWidth(child, childStyle, computed, contentWidth) + horizontalInsets(childStyle))
+			local x = childStyle.float == "right" and (contentWidth - width) or 0
+			local box = layoutElement(child, childStyle, contentX + x, contentY + cursorY, width, nil, width, nil)
+			boxes[#boxes + 1] = box
+			cursorY = math.max(cursorY, box.y + box.height - contentY)
 		else
 			local marginTop = sideMargin(childStyle, "Top", contentWidth)
 			local marginBottom = sideMargin(childStyle, "Bottom", contentWidth)
@@ -795,10 +937,43 @@ local function layoutBlock(entries, containerStyle, computed, contentX, contentY
 				remaining
 			)
 			boxes[#boxes + 1] = box
+			if childStyle.position == "sticky" then
+				local top = Css.resolve(childStyle.top, contentHeightAvailable, nil)
+				local left = Css.resolve(childStyle.left, contentWidth, nil)
+				if top or left then
+					shiftBox(box, left or 0, top or 0)
+				end
+			end
 			cursorY = box.y + box.height - contentY + marginBottom
 		end
 	end
-	return boxes, cursorY, absolute
+	return boxes, cursorY, absolute, fixed
+end
+
+local function layoutFixed(parentBox, entries, computed)
+	local viewWidth = viewportWidth > 0 and viewportWidth or 760
+	local viewHeight = viewportHeight > 0 and viewportHeight or 520
+	for _, entry in entries do
+		local child, style = entry.child, entry.style
+		local width = Css.resolve(style.width, viewWidth, nil)
+		local height = Css.resolve(style.height, viewHeight, nil)
+		local left = Css.resolve(style.left, viewWidth, nil)
+		local right = Css.resolve(style.right, viewWidth, nil)
+		local top = Css.resolve(style.top, viewHeight, nil)
+		local bottom = Css.resolve(style.bottom, viewHeight, nil)
+		if not width then
+			width = naturalContentWidth(child, style, computed, viewWidth) + horizontalInsets(style)
+		end
+		local box = layoutElement(child, style, 0, 0, width, height, width, height)
+		if not height then
+			height = box.height
+		end
+		local x = left or (right and (viewWidth - width - right)) or 0
+		local y = top or (bottom and (viewHeight - height - bottom)) or 0
+		shiftBox(box, x, y)
+		box.fixed = true
+		parentBox.children[#parentBox.children + 1] = box
+	end
 end
 
 local function layoutAbsolute(parentBox, absolute, computed)
@@ -834,6 +1009,11 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	local vertical = padTop + padBottom + border * 2
 
 	local widthSpec = forcedWidth or Css.resolve(style.width, availableWidth, nil)
+	if not widthSpec and node.tag == "canvas" then
+		widthSpec = tonumber(node.attrs and node.attrs.width) or 300
+	elseif not widthSpec and node.tag == "video" then
+		widthSpec = tonumber(node.attrs and node.attrs.width) or 320
+	end
 	local contentWidth
 	local borderBoxWidth
 	if widthSpec then
@@ -870,6 +1050,7 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	local children = {}
 	local contentHeight = 0
 	local absolute = {}
+	local fixed = {}
 
 	if node.attrs and node.attrs["data-icon"] then
 		-- An icon has no children; its font-size is its box size.
@@ -888,7 +1069,7 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 		)
 	elseif style.display == "grid" then
 		local entries = visibleEntries(node, computedRef)
-		children, contentHeight, absolute = layoutGrid(
+		children, contentHeight, absolute, fixed = layoutGrid(
 			node,
 			entries,
 			style,
@@ -910,7 +1091,7 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 		if not hasBlock then
 			children, contentHeight = layoutInline(entries, style, computedRef, contentX, contentY, contentWidth)
 		else
-			children, contentHeight, absolute = layoutBlock(
+			children, contentHeight, absolute, fixed = layoutBlock(
 				entries,
 				style,
 				computedRef,
@@ -923,6 +1104,9 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	end
 
 	local heightSpec = forcedHeight or Css.resolve(style.height, availableHeight, nil)
+	if not heightSpec and node.tag == "canvas" then
+		heightSpec = tonumber(node.attrs and node.attrs.height) or 150
+	end
 	if not heightSpec and style.aspectRatio and style.aspectRatio > 0 then
 		local ratioHeight = borderBoxWidth / style.aspectRatio
 		heightSpec = style.boxSizing == "border-box" and ratioHeight or (ratioHeight - vertical)
@@ -961,6 +1145,9 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	if #absolute > 0 then
 		layoutAbsolute(box, absolute, computedRef)
 	end
+	if #fixed > 0 then
+		layoutFixed(box, fixed, computedRef)
+	end
 
 	if style.overflow == "auto" or style.overflow == "scroll" then
 		box.scroll = true
@@ -976,6 +1163,8 @@ end
 
 function Layout.build(document, computed, width, height)
 	computedRef = computed
+	viewportWidth = width
+	viewportHeight = height
 	local body = document.body
 	local style = computed[body.id]
 	local root = layoutElement(body, style, 0, 0, width, height, width, nil)

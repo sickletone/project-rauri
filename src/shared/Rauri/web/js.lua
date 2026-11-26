@@ -48,6 +48,9 @@ local KEYWORDS = {
 	["static"] = true,
 	["do"] = true,
 	["delete"] = true,
+	["async"] = true,
+	["await"] = true,
+	["yield"] = true,
 }
 
 -- Longest first.
@@ -109,6 +112,19 @@ local function isArray(value)
 	return metatable == ARRAY_MT or (type(metatable) == "table" and metatable.__jsarray == true)
 end
 
+local function regexAllowed(previous)
+	if not previous then
+		return true
+	end
+	if previous.type == "punc" then
+		return previous.value ~= ")" and previous.value ~= "]" and previous.value ~= "}"
+	elseif previous.type == "keyword" then
+		local value = previous.value
+		return value ~= "true" and value ~= "false" and value ~= "null" and value ~= "undefined" and value ~= "this"
+	end
+	return false
+end
+
 local function tokenize(source)
 	local tokens = {}
 	local index = 1
@@ -148,6 +164,45 @@ local function tokenize(source)
 				line += 1
 			end
 			index = close and (close + 2) or (length + 1)
+		elseif ch == "/" and regexAllowed(tokens[#tokens]) then
+			local startLine = line
+			local cursor = index + 1
+			local buffer = {}
+			local inClass = false
+			while cursor <= length do
+				local current = source:sub(cursor, cursor)
+				if current == "\\" then
+					buffer[#buffer + 1] = source:sub(cursor, cursor + 1)
+					cursor += 2
+				elseif current == "[" then
+					inClass = true
+					buffer[#buffer + 1] = current
+					cursor += 1
+				elseif current == "]" then
+					inClass = false
+					buffer[#buffer + 1] = current
+					cursor += 1
+				elseif current == "/" and not inClass then
+					break
+				elseif current == "\n" then
+					break
+				else
+					buffer[#buffer + 1] = current
+					cursor += 1
+				end
+			end
+			local flags = {}
+			cursor += 1
+			while cursor <= length and source:sub(cursor, cursor):match("[%a]") do
+				flags[#flags + 1] = source:sub(cursor, cursor)
+				cursor += 1
+			end
+			tokens[#tokens + 1] = {
+				type = "regex",
+				value = { source = table.concat(buffer), flags = table.concat(flags) },
+				line = startLine,
+			}
+			index = cursor
 		elseif ch == "'" or ch == '"' then
 			local quote = ch
 			local buffer = {}
@@ -506,7 +561,9 @@ function Parser:objectLiteral()
 		if self:match("punc", "...") then
 			fields[#fields + 1] = { spread = true, value = self:expression(1) }
 		else
-			local field = {}
+			local async = self:match("keyword", "async") ~= nil
+			local generator = self:match("punc", "*") ~= nil
+			local field = { async = async, generator = generator }
 			if self:at("punc", "[") then
 				self:next()
 				field.key = self:expression(0)
@@ -546,7 +603,9 @@ function Parser:classRest(name)
 			-- empty member
 		else
 			local static = self:match("keyword", "static") ~= nil
-			local member = { static = static }
+			local async = self:match("keyword", "async") ~= nil
+			local generator = self:match("punc", "*") ~= nil
+			local member = { static = static, async = async, generator = generator }
 			if self:at("punc", "[") then
 				self:next()
 				member.key = self:expression(0)
@@ -586,6 +645,9 @@ function Parser:primary()
 	if token.type == "number" or token.type == "string" then
 		self:next()
 		return { kind = "literal", value = token.value }
+	elseif token.type == "regex" then
+		self:next()
+		return { kind = "regex", source = token.value.source, flags = token.value.flags }
 	elseif token.type == "template" then
 		self:next()
 		return { kind = "template", parts = self:templateParts(token.value) }
@@ -600,7 +662,41 @@ function Parser:primary()
 			return { kind = "new", ctor = target, args = {} }
 		end
 		self:next()
-		if value == "true" then
+		if value == "async" then
+			if self:at("keyword", "function") then
+				self:next()
+				local generator = self:match("punc", "*") ~= nil
+				local name
+				if self:at("ident") then
+					name = self:next().value
+				end
+				local params, body = self:functionRest()
+				return { kind = "function", name = name, params = params, body = body, async = true, generator = generator }
+			elseif self:at("ident") and self:peek(1).type == "punc" and self:peek(1).value == "=>" then
+				local name = self:next().value
+				self:next()
+				return {
+					kind = "arrow",
+					params = { { pattern = { kind = "identPattern", name = name } } },
+					body = self:arrowBody(),
+					async = true,
+				}
+			else
+				local arrow = self:tryArrow()
+				if arrow then
+					arrow.async = true
+					return arrow
+				end
+				self:errorAt(token, "expected function or arrow after async")
+			end
+		elseif value == "await" then
+			return { kind = "await", value = self:unary() }
+		elseif value == "yield" then
+			local nextToken = self:peek()
+			local stops = nextToken.type == "eof"
+				or (nextToken.type == "punc" and (nextToken.value == ";" or nextToken.value == "}" or nextToken.value == ")" or nextToken.value == "]" or nextToken.value == "," or nextToken.value == ":"))
+			return { kind = "yield", value = stops and nil or self:expression(0) }
+		elseif value == "true" then
 			return { kind = "literal", value = true }
 		elseif value == "false" then
 			return { kind = "literal", value = false }
@@ -627,12 +723,13 @@ function Parser:primary()
 			end
 			return { kind = "super" }
 		elseif value == "function" then
+			local generator = self:match("punc", "*") ~= nil
 			local name
 			if self:at("ident") then
 				name = self:next().value
 			end
 			local params, body = self:functionRest()
-			return { kind = "function", name = name, params = params, body = body }
+			return { kind = "function", name = name, params = params, body = body, generator = generator }
 		elseif value == "class" then
 			local name
 			if self:at("ident") then
@@ -714,7 +811,11 @@ function Parser:postfix()
 		local token = self:peek()
 		if token.type == "punc" and token.value == "." then
 			self:next()
-			local name = self:expect("ident").value
+			local propertyToken = self:peek()
+			if propertyToken.type ~= "ident" and propertyToken.type ~= "keyword" then
+				self:errorAt(propertyToken, "expected property name")
+			end
+			local name = self:next().value
 			node = { kind = "member", object = node, property = { kind = "literal", value = name } }
 		elseif token.type == "punc" and token.value == "?." then
 			self:next()
@@ -726,7 +827,11 @@ function Parser:postfix()
 				self:expect("punc", "]")
 				node = { kind = "member", object = node, property = property, optional = true }
 			else
-				local name = self:expect("ident").value
+				local propertyToken = self:peek()
+				if propertyToken.type ~= "ident" and propertyToken.type ~= "keyword" then
+					self:errorAt(propertyToken, "expected property name")
+				end
+				local name = self:next().value
 				node = { kind = "member", object = node, property = { kind = "literal", value = name }, optional = true }
 			end
 		elseif token.type == "punc" and token.value == "[" then
@@ -954,11 +1059,19 @@ function Parser:statement()
 		local value = token.value
 		if value == "let" or value == "const" or value == "var" then
 			return self:varDeclaration()
-		elseif value == "function" then
+		elseif value == "async" then
 			self:next()
+			self:expect("keyword", "function")
+			local generator = self:match("punc", "*") ~= nil
 			local name = self:expect("ident").value
 			local params, body = self:functionRest()
-			return { kind = "function", name = name, params = params, body = body }
+			return { kind = "function", name = name, params = params, body = body, async = true, generator = generator }
+		elseif value == "function" then
+			self:next()
+			local generator = self:match("punc", "*") ~= nil
+			local name = self:expect("ident").value
+			local params, body = self:functionRest()
+			return { kind = "function", name = name, params = params, body = body, generator = generator }
 		elseif value == "class" then
 			self:next()
 			local name = self:expect("ident").value
@@ -1194,6 +1307,466 @@ local function spreadArgs(nodes, env, context)
 		end
 	end
 	return args
+end
+
+-- Regular expressions ----------------------------------------------------
+
+local regexCompile
+local regexFindAll
+
+do
+	local function copyCaptures(captures)
+		local out = {}
+		for index, value in captures do
+			out[index] = value
+		end
+		return out
+	end
+
+	local function classHas(items, char, ignoreCase)
+		for _, item in items do
+			local matched = false
+			if item.kind == "char" then
+				matched = ignoreCase and char:lower() == item.char:lower() or char == item.char
+			elseif item.kind == "range" then
+				local current = ignoreCase and char:lower() or char
+				local from = ignoreCase and item.from:lower() or item.from
+				local to = ignoreCase and item.to:lower() or item.to
+				matched = current >= from and current <= to
+			elseif item.kind == "d" then
+				matched = char:match("%d") ~= nil
+			elseif item.kind == "w" then
+				matched = char:match("[%w_]") ~= nil
+			elseif item.kind == "s" then
+				matched = char:match("%s") ~= nil
+			end
+			if item.negate then
+				matched = not matched
+			end
+			if matched then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function classMatches(class, char, ignoreCase)
+		local matched = classHas(class.items, char, ignoreCase)
+		if class.negated then
+			return not matched
+		end
+		return matched
+	end
+
+	local function parsePattern(source)
+		local index = 1
+		local length = #source
+		local captures = 0
+
+		local function peek()
+			return source:sub(index, index)
+		end
+
+		local function take()
+			local char = source:sub(index, index)
+			index += 1
+			return char
+		end
+
+		local parseAlternation, parseSequence, parseAtom, parseClass
+
+		parseClass = function()
+			local negated = false
+			if peek() == "^" then
+				take()
+				negated = true
+			end
+			local items = {}
+			while index <= length and peek() ~= "]" do
+				local char = take()
+				if char == "\\" then
+					local escaped = take()
+					if escaped == "d" or escaped == "w" or escaped == "s" then
+						items[#items + 1] = { kind = escaped }
+					elseif escaped == "D" or escaped == "W" or escaped == "S" then
+						items[#items + 1] = { kind = escaped:lower(), negate = true }
+					elseif escaped == "n" then
+						items[#items + 1] = { kind = "char", char = "\n" }
+					else
+						items[#items + 1] = { kind = "char", char = escaped }
+					end
+				elseif peek() == "-" and source:sub(index + 1, index + 1) ~= "]" and source:sub(index + 1, index + 1) ~= "" then
+					take()
+					items[#items + 1] = { kind = "range", from = char, to = take() }
+				else
+					items[#items + 1] = { kind = "char", char = char }
+				end
+			end
+			if peek() == "]" then
+				take()
+			end
+			return { type = "class", negated = negated, items = items }
+		end
+
+		parseAtom = function()
+			local char = peek()
+			if char == "(" then
+				take()
+				local capture = true
+				if peek() == "?" and source:sub(index + 1, index + 1) == ":" then
+					index += 2
+					capture = false
+				end
+				local body = parseAlternation()
+				if peek() == ")" then
+					take()
+				end
+				local group = { type = "group", body = body, capture = capture }
+				if capture then
+					captures += 1
+					group.index = captures
+				end
+				return group
+			elseif char == "[" then
+				take()
+				return parseClass()
+			elseif char == "." then
+				take()
+				return { type = "any" }
+			elseif char == "^" then
+				take()
+				return { type = "assert", kind = "start" }
+			elseif char == "$" then
+				take()
+				return { type = "assert", kind = "end" }
+			elseif char == "\\" then
+				take()
+				local escaped = take()
+				if escaped == "d" or escaped == "w" or escaped == "s" then
+					return { type = "class", items = { { kind = escaped } } }
+				elseif escaped == "D" or escaped == "W" or escaped == "S" then
+					return { type = "class", items = { { kind = escaped:lower(), negate = true } } }
+				elseif escaped == "b" then
+					return { type = "assert", kind = "word" }
+				elseif escaped == "B" then
+					return { type = "assert", kind = "notword" }
+				elseif escaped == "n" then
+					return { type = "char", char = "\n" }
+				elseif escaped == "t" then
+					return { type = "char", char = "\t" }
+				elseif escaped == "r" then
+					return { type = "char", char = "\r" }
+				end
+				return { type = "char", char = escaped }
+			else
+				take()
+				return { type = "char", char = char }
+			end
+		end
+
+		local function parseTerm()
+			local atom = parseAtom()
+			local quantifier
+			local nextChar = peek()
+			if nextChar == "*" then
+				take()
+				quantifier = { min = 0 }
+			elseif nextChar == "+" then
+				take()
+				quantifier = { min = 1 }
+			elseif nextChar == "?" then
+				take()
+				quantifier = { min = 0, max = 1 }
+			elseif nextChar == "{" then
+				local close = source:find("}", index, true)
+				local body = close and source:sub(index + 1, close - 1) or ""
+				local minimum, maximum = body:match("^(%d+)%,(%d*)$")
+				if not minimum then
+					minimum = body:match("^(%d+)$")
+					maximum = minimum
+				end
+				if minimum then
+					index = (close or index) + 1
+					quantifier = {
+						min = tonumber(minimum),
+						max = maximum and maximum ~= "" and tonumber(maximum) or nil,
+					}
+				end
+			end
+			if quantifier then
+				if peek() == "?" then
+					take()
+					quantifier.greedy = false
+				end
+				return { atom = atom, quant = quantifier }
+			end
+			return { atom = atom }
+		end
+
+		parseSequence = function()
+			local terms = {}
+			while index <= length do
+				local char = peek()
+				if char == "|" or char == ")" then
+					break
+				end
+				terms[#terms + 1] = parseTerm()
+			end
+			return { terms = terms }
+		end
+
+		parseAlternation = function()
+			local options = { parseSequence() }
+			while peek() == "|" do
+				take()
+				options[#options + 1] = parseSequence()
+			end
+			return { options = options }
+		end
+
+		return parseAlternation()
+	end
+
+	local matchAlt, matchSeq
+
+	local function matchAtom(atom, input, position, captures, regex)
+		if atom.type == "char" then
+			local char = input:sub(position + 1, position + 1)
+			if char == "" then
+				return nil
+			end
+			if regex.ignoreCase then
+				if char:lower() ~= atom.char:lower() then
+					return nil
+				end
+			elseif char ~= atom.char then
+				return nil
+			end
+			return position + 1, captures
+		elseif atom.type == "any" then
+			local char = input:sub(position + 1, position + 1)
+			if char == "" or (char == "\n" and not regex.dotAll) then
+				return nil
+			end
+			return position + 1, captures
+		elseif atom.type == "class" then
+			local char = input:sub(position + 1, position + 1)
+			if char == "" then
+				return nil
+			end
+			if classMatches(atom, char, regex.ignoreCase) then
+				return position + 1, captures
+			end
+			return nil
+		elseif atom.type == "group" then
+			local endPosition, newCaptures = matchAlt(atom.body, input, position, copyCaptures(captures), regex)
+			if not endPosition then
+				return nil
+			end
+			if atom.index then
+				newCaptures = copyCaptures(newCaptures)
+				newCaptures[atom.index] = input:sub(position + 1, endPosition)
+			end
+			return endPosition, newCaptures
+		elseif atom.type == "assert" then
+			if atom.kind == "start" then
+				return position == 0 and position or nil, captures
+			elseif atom.kind == "end" then
+				return position == #input and position or nil, captures
+			elseif atom.kind == "word" or atom.kind == "notword" then
+				local before = input:sub(position, position):match("[%w_]") ~= nil
+				local after = input:sub(position + 1, position + 1):match("[%w_]") ~= nil
+				local boundary = before ~= after
+				if atom.kind == "word" then
+					return boundary and position or nil, captures
+				end
+				return (not boundary) and position or nil, captures
+			end
+		end
+		return nil
+	end
+
+	matchSeq = function(sequence, input, position, captures, regex)
+		local terms = sequence.terms
+		local function step(termIndex, current, caps)
+			if termIndex > #terms then
+				return current, caps
+			end
+			local term = terms[termIndex]
+			if term.quant then
+				local minimum = term.quant.min or 0
+				local maximum = term.quant.max
+				local positions = { [0] = current }
+				local capturesAt = { [0] = caps }
+				local count = 0
+				local scanPosition, scanCaptures = current, caps
+				while maximum == nil or count < maximum do
+					local nextPosition, nextCaptures = matchAtom(term.atom, input, scanPosition, scanCaptures, regex)
+					if not nextPosition or nextPosition == scanPosition then
+						break
+					end
+					count += 1
+					positions[count] = nextPosition
+					capturesAt[count] = nextCaptures
+					scanPosition, scanCaptures = nextPosition, nextCaptures
+				end
+				local order = {}
+				if term.quant.greedy ~= false then
+					for candidate = count, minimum, -1 do
+						order[#order + 1] = candidate
+					end
+				else
+					for candidate = minimum, count do
+						order[#order + 1] = candidate
+					end
+				end
+				for _, candidate in order do
+					local endPosition, endCaptures = step(termIndex + 1, positions[candidate], capturesAt[candidate])
+					if endPosition then
+						return endPosition, endCaptures
+					end
+				end
+				return nil
+			end
+			local nextPosition, nextCaptures = matchAtom(term.atom, input, current, caps, regex)
+			if not nextPosition then
+				return nil
+			end
+			return step(termIndex + 1, nextPosition, nextCaptures)
+		end
+		return step(1, position, captures)
+	end
+
+	matchAlt = function(alternation, input, position, captures, regex)
+		for _, option in alternation.options do
+			local endPosition, endCaptures = matchSeq(option, input, position, copyCaptures(captures), regex)
+			if endPosition then
+				return endPosition, endCaptures
+			end
+		end
+		return nil
+	end
+
+	regexFindAll = function(regex, input)
+		local results = {}
+		local position = 0
+		while position <= #input do
+			local endPosition, captures = matchAlt(regex.program, input, position, {}, regex)
+			if endPosition then
+				results[#results + 1] = {
+					index = position,
+					text = input:sub(position + 1, endPosition),
+					captures = captures,
+				}
+				position = endPosition > position and endPosition or position + 1
+			else
+				position += 1
+			end
+		end
+		return results
+	end
+
+	regexCompile = function(source, flags)
+		flags = flags or ""
+		local regex = {
+			__jsRegex = true,
+			source = source,
+			flags = flags,
+			program = parsePattern(source),
+			global = flags:find("g") ~= nil,
+			ignoreCase = flags:find("i") ~= nil,
+			multiline = flags:find("m") ~= nil,
+			dotAll = flags:find("s") ~= nil,
+			lastIndex = 0,
+		}
+		regex.test = function(input)
+			return regexFindAll(regex, tostring(input))[1] ~= nil
+		end
+		regex.exec = function(input)
+			input = tostring(input)
+			local start = regex.global and regex.lastIndex or 0
+			if start > #input then
+				regex.lastIndex = 0
+				return nil
+			end
+			local matches = regexFindAll(regex, input)
+			for _, match in matches do
+				if match.index >= start then
+					if regex.global then
+						regex.lastIndex = match.index + math.max(1, #match.text)
+					end
+					local out = Js.array({})
+					out[1] = match.text
+					out.index = match.index
+					for index, capture in match.captures or {} do
+						out[index + 1] = capture
+					end
+					return out
+				end
+			end
+			if regex.global then
+				regex.lastIndex = 0
+			end
+			return nil
+		end
+		return regex
+	end
+
+	Js.regex = regexCompile
+end
+
+local function regexResultArray(result)
+	if not result then
+		return nil
+	end
+	local out = Js.array({})
+	out[1] = result.text
+	out.index = result.index
+	for index, capture in result.captures or {} do
+		out[index + 1] = capture
+	end
+	return out
+end
+
+local function regexReplaceValue(regex, input, replacement, forceAll)
+	local matches = regexFindAll(regex, input)
+	if not (forceAll or regex.global) and #matches > 1 then
+		matches = { matches[1] }
+	end
+	if #matches == 0 then
+		return input
+	end
+	local parts = {}
+	local last = 0
+	for _, match in matches do
+		parts[#parts + 1] = input:sub(last + 1, match.index)
+		local replacementText
+		if type(replacement) == "function" then
+			local args = { n = 1 + #(match.captures or {}) }
+			args[1] = match.text
+			for index, capture in match.captures or {} do
+				args[index + 1] = capture
+			end
+			replacementText = toJsString(callFunction(replacement, args))
+		else
+			replacementText = tostring(replacement):gsub("%$([%$&%d]+)", function(token)
+				if token == "$" then
+					return "$"
+				elseif token == "&" then
+					return match.text
+				end
+				local index = tonumber(token)
+				if index == 0 then
+					return match.text
+				end
+				return (match.captures or {})[index] or ""
+			end)
+		end
+		parts[#parts + 1] = replacementText
+		last = match.index + #match.text
+	end
+	parts[#parts + 1] = input:sub(last + 1)
+	return table.concat(parts)
 end
 
 local function arrayMember(array, key)
@@ -1502,11 +2075,56 @@ local function stringMember(value, key)
 			end
 			return value:sub(first + 1, math.min(last, length))
 		end
+	elseif key == "match" then
+		return function(pattern)
+			if type(pattern) == "table" and pattern.__jsRegex then
+				local matches = regexFindAll(pattern, value)
+				if pattern.global then
+					local out = Js.array({})
+					for _, item in matches do
+						out[#out + 1] = item.text
+					end
+					return out
+				end
+				return regexResultArray(matches[1])
+			end
+			local found = value:find(tostring(pattern), 1, true)
+			return found and value:sub(found) or nil
+		end
+	elseif key == "matchAll" then
+		return function(pattern)
+			local out = Js.array({})
+			if type(pattern) == "table" and pattern.__jsRegex then
+				for _, item in regexFindAll(pattern, value) do
+					out[#out + 1] = regexResultArray(item)
+				end
+			end
+			return out
+		end
+	elseif key == "search" then
+		return function(pattern)
+			if type(pattern) == "table" and pattern.__jsRegex then
+				local match = regexFindAll(pattern, value)[1]
+				return match and match.index or -1
+			end
+			local found = value:find(tostring(pattern), 1, true)
+			return found and (found - 1) or -1
+		end
 	elseif key == "split" then
 		return function(separator)
 			local out = Js.array({})
 			if separator == nil then
 				out[1] = value
+				return out
+			end
+			if type(separator) == "table" and separator.__jsRegex then
+				local matches = regexFindAll(separator, value)
+				local last = 0
+				for _, match in matches do
+					out[#out + 1] = value:sub(last + 1, match.index)
+					last = match.index + #match.text
+				end
+				out[#out + 1] = value:sub(last + 1)
 				return out
 			end
 			separator = tostring(separator)
@@ -1530,6 +2148,9 @@ local function stringMember(value, key)
 		end
 	elseif key == "replace" or key == "replaceAll" then
 		return function(needle, replacement)
+			if type(needle) == "table" and needle.__jsRegex then
+				return regexReplaceValue(needle, value, replacement, key == "replaceAll")
+			end
 			needle = tostring(needle)
 			local count = key == "replace" and 1 or nil
 			local function substitute(found)
@@ -1822,47 +2443,289 @@ local function bindParams(params, args, env, context)
 	end
 end
 
+-- Promises and async scheduling -------------------------------------------
+
+local schedulePromise = function(fn)
+	if task and task.defer then
+		task.defer(fn)
+	elseif task and task.spawn then
+		task.spawn(fn)
+	else
+		fn()
+	end
+end
+
+local newPromise
+local settlePromise
+
+newPromise = function()
+	local promise = { __jsPromise = true, state = "pending", value = nil, handlers = {} }
+	promise["then"] = function(onFulfilled, onRejected)
+		local nextPromise = newPromise()
+		local source = promise
+		local function run()
+			local handler = source.state == "fulfilled" and onFulfilled or onRejected
+			if type(handler) ~= "function" then
+				settlePromise(nextPromise, source.state, source.value)
+				return
+			end
+			local ok, result = pcall(handler, source.value)
+			if not ok then
+				settlePromise(nextPromise, "rejected", result)
+				return
+			end
+			if type(result) == "table" and result.__jsPromise then
+				result["then"](function(value)
+					settlePromise(nextPromise, "fulfilled", value)
+				end, function(err)
+					settlePromise(nextPromise, "rejected", err)
+				end)
+			else
+				settlePromise(nextPromise, "fulfilled", result)
+			end
+		end
+		if source.state == "pending" then
+			source.handlers[#source.handlers + 1] = run
+		else
+			schedulePromise(run)
+		end
+		return nextPromise
+	end
+	promise.catch = function(onRejected)
+		return promise["then"](nil, onRejected)
+	end
+	promise.finally = function(callback)
+		return promise["then"](function(value)
+			if type(callback) == "function" then
+				callback()
+			end
+			return value
+		end, function(err)
+			if type(callback) == "function" then
+				callback()
+			end
+			error(err, 0)
+		end)
+	end
+	return promise
+end
+
+settlePromise = function(promise, state, value)
+	if promise.state ~= "pending" then
+		return
+	end
+	promise.state = state
+	promise.value = value
+	local handlers = promise.handlers
+	promise.handlers = {}
+	for _, handler in handlers do
+		schedulePromise(handler)
+	end
+end
+
+Js.promise = function(executor)
+	local promise = newPromise()
+	if type(executor) == "function" then
+		local ok, err = pcall(executor, function(value)
+			settlePromise(promise, "fulfilled", value)
+		end, function(reason)
+			settlePromise(promise, "rejected", reason)
+		end)
+		if not ok then
+			settlePromise(promise, "rejected", err)
+		end
+	end
+	return promise
+end
+
+Js.promiseResolve = function(value)
+	if type(value) == "table" and value.__jsPromise then
+		return value
+	end
+	local promise = newPromise()
+	settlePromise(promise, "fulfilled", value)
+	return promise
+end
+
+Js.promiseReject = function(reason)
+	local promise = newPromise()
+	settlePromise(promise, "rejected", reason)
+	return promise
+end
+
+Js.promiseAll = function(list)
+	local promise = newPromise()
+	local total = 0
+	if type(list) == "table" then
+		total = #list
+	end
+	if total == 0 then
+		settlePromise(promise, "fulfilled", Js.array({}))
+		return promise
+	end
+	local results = Js.array({})
+	local remaining = total
+	for index = 1, total do
+		Js.promiseResolve(list[index])["then"](function(value)
+			results[index] = value
+			remaining -= 1
+			if remaining == 0 then
+				settlePromise(promise, "fulfilled", results)
+			end
+		end, function(err)
+			settlePromise(promise, "rejected", err)
+		end)
+	end
+	return promise
+end
+
+Js.promiseRace = function(list)
+	local promise = newPromise()
+	if type(list) == "table" then
+		for index = 1, #list do
+			Js.promiseResolve(list[index])["then"](function(value)
+				settlePromise(promise, "fulfilled", value)
+			end, function(err)
+				settlePromise(promise, "rejected", err)
+			end)
+		end
+	end
+	return promise
+end
+
 makeFunction = function(node, closure, context)
 	local isArrow = node.kind == "arrow"
 	local lexicalThis = context.currentThis
 	local fn
 	local info = { isArrow = isArrow }
-	fn = function(...)
-		local args = table.pack(...)
-		local thisValue
-		if args.n >= 2 and args[args.n - 1] == THIS then
-			thisValue = args[args.n]
-			args[args.n] = nil
-			args[args.n - 1] = nil
-			args.n -= 2
+
+	local function createEnvironment(args)
+		local callEnv = Env.new(closure)
+		callEnv:declare("arguments", args)
+		if node.name then
+			callEnv:declare(node.name, fn)
 		end
-		local savedThis = context.currentThis
-		context.currentThis = isArrow and lexicalThis or thisValue
-		local ok, result = pcall(function()
-			local callEnv = Env.new(closure)
-			callEnv:declare("arguments", args)
-			if node.name then
-				callEnv:declare(node.name, fn)
+		bindParams(node.params, args, callEnv, context)
+		return callEnv
+	end
+
+	local function runBody(callEnv)
+		context.steps += 1
+		if context.steps > MAX_STEPS then
+			error("JS error: script exceeded the step limit", 0)
+		end
+		if node.body.kind == "block" then
+			local control = execBlock(node.body, callEnv, context)
+			if control and control.type == "return" then
+				return control.value
 			end
-			bindParams(node.params, args, callEnv, context)
-			context.steps += 1
-			if context.steps > MAX_STEPS then
-				error("JS error: script exceeded the step limit", 0)
+			return nil
+		end
+		return evalExpression(node.body.expression, callEnv, context)
+	end
+
+	if node.generator then
+		fn = function(...)
+			local args = table.pack(...)
+			local thisValue
+			if args.n >= 2 and args[args.n - 1] == THIS then
+				thisValue = args[args.n]
+				args[args.n] = nil
+				args[args.n - 1] = nil
+				args.n -= 2
 			end
-			if node.body.kind == "block" then
-				local control = execBlock(node.body, callEnv, context)
-				if control and control.type == "return" then
-					return control.value
+			local callEnv = createEnvironment(args)
+			local savedThis = context.currentThis
+			local thread = coroutine.create(function()
+				context.currentThis = isArrow and lexicalThis or thisValue
+				local result = runBody(callEnv)
+				context.currentThis = savedThis
+				return result
+			end)
+			local generator = { __jsGenerator = true, done = false, thread = thread }
+			generator.next = function(...)
+				if generator.done then
+					return { value = nil, done = true }
 				end
-				return nil
+				local ok, value = coroutine.resume(thread, ...)
+				if not ok then
+					generator.done = true
+					error(value, 0)
+				end
+				if coroutine.status(thread) == "dead" then
+					generator.done = true
+					return { value = value, done = true }
+				end
+				return { value = value, done = false }
 			end
-			return evalExpression(node.body.expression, callEnv, context)
-		end)
-		context.currentThis = savedThis
-		if not ok then
-			error(result, 0)
+			return generator
 		end
-		return result
+	elseif node.async then
+		fn = function(...)
+			local args = table.pack(...)
+			local thisValue
+			if args.n >= 2 and args[args.n - 1] == THIS then
+				thisValue = args[args.n]
+				args[args.n] = nil
+				args[args.n - 1] = nil
+				args.n -= 2
+			end
+			local callEnv = createEnvironment(args)
+			local promise = newPromise()
+			local savedThis = context.currentThis
+			local thread = coroutine.create(function()
+				context.currentThis = isArrow and lexicalThis or thisValue
+				local result = runBody(callEnv)
+				context.currentThis = savedThis
+				return result
+			end)
+			local function step(ok, value)
+				if not ok then
+					settlePromise(promise, "rejected", value)
+					return
+				end
+				if coroutine.status(thread) == "dead" then
+					settlePromise(promise, "fulfilled", value)
+					return
+				end
+				if type(value) == "table" and value.__await then
+					value.__await["then"](function(result)
+						schedulePromise(function()
+							step(coroutine.resume(thread, { __awaitValue = result }))
+						end)
+					end, function(err)
+						schedulePromise(function()
+							step(coroutine.resume(thread, { __awaitError = err }))
+						end)
+					end)
+				else
+					settlePromise(promise, "fulfilled", value)
+				end
+			end
+			step(coroutine.resume(thread))
+			return promise
+		end
+	else
+		fn = function(...)
+			local args = table.pack(...)
+			local thisValue
+			if args.n >= 2 and args[args.n - 1] == THIS then
+				thisValue = args[args.n]
+				args[args.n] = nil
+				args[args.n - 1] = nil
+				args.n -= 2
+			end
+			local savedThis = context.currentThis
+			context.currentThis = isArrow and lexicalThis or thisValue
+			local ok, result = pcall(function()
+				return runBody(createEnvironment(args))
+			end)
+			context.currentThis = savedThis
+			if not ok then
+				error(result, 0)
+			end
+			return result
+		end
 	end
 	functionInfo[fn] = info
 	return fn
@@ -1886,7 +2749,13 @@ evaluateClass = function(node, env, context)
 	for _, member in node.members do
 		local key = member.computed and evalExpression(member.key, classEnv, context) or member.key
 		if member.kind == "method" then
-			local fn = makeFunction({ kind = "function", params = member.params, body = member.body }, classEnv, context)
+			local fn = makeFunction({
+				kind = "function",
+				params = member.params,
+				body = member.body,
+				async = member.async,
+				generator = member.generator,
+			}, classEnv, context)
 			if member.constructor then
 				classObject.constructor = fn
 			elseif member.static then
@@ -1914,6 +2783,35 @@ evalExpression = function(node, env, context)
 	local kind = node.kind
 	if kind == "literal" then
 		return node.value
+	elseif kind == "regex" then
+		return regexCompile(node.source, node.flags)
+	elseif kind == "await" then
+		local value = evalExpression(node.value, env, context)
+		if type(value) == "table" and value.__jsPromise then
+			if value.state == "rejected" then
+				error(value.value, 0)
+			elseif value.state == "fulfilled" then
+				return value.value
+			end
+			if not coroutine.isyieldable() then
+				error("await on a pending promise outside an async function", 0)
+			end
+			local resumed = coroutine.yield({ __await = value })
+			if type(resumed) == "table" and resumed.__awaitError ~= nil then
+				error(resumed.__awaitError, 0)
+			end
+			return resumed and resumed.__awaitValue or nil
+		end
+		return value
+	elseif kind == "yield" then
+		if not coroutine.isyieldable() then
+			error("yield outside a generator", 0)
+		end
+		local yielded
+		if node.value then
+			yielded = evalExpression(node.value, env, context)
+		end
+		return coroutine.yield(yielded)
 	elseif kind == "identifier" then
 		return env:get(node.name)
 	elseif kind == "this" then
@@ -1962,7 +2860,13 @@ evalExpression = function(node, env, context)
 			else
 				local key = field.computed and evalExpression(field.key, env, context) or field.key
 				if field.method then
-					out[key] = makeFunction({ kind = "function", params = field.method.params, body = field.method.body }, env, context)
+					out[key] = makeFunction({
+						kind = "function",
+						params = field.method.params,
+						body = field.method.body,
+						async = field.async,
+						generator = field.generator,
+					}, env, context)
 				else
 					out[key] = evalExpression(field.value, env, context)
 				end
@@ -2220,6 +3124,25 @@ execStatement = function(node, env, context)
 		return nil
 	elseif kind == "forOf" then
 		local iterable = evalExpression(node.iterable, env, context)
+		if type(iterable) == "table" and iterable.__jsGenerator then
+			while true do
+				local step = iterable.next()
+				if step.done then
+					break
+				end
+				local iterationEnv = Env.new(env)
+				bindPattern(node.pattern, step.value, iterationEnv, context, true)
+				local control = execStatement(node.body, iterationEnv, context)
+				if control then
+					if control.type == "break" then
+						break
+					elseif control.type == "return" then
+						return control
+					end
+				end
+			end
+			return nil
+		end
 		local values = {}
 		if isArray(iterable) then
 			for index = 1, #iterable do
@@ -2353,6 +3276,8 @@ function Js.run(source, host)
 end
 
 Js.tokenize = tokenize
+Js.toJsString = toJsString
+Js.promiseNew = newPromise
 Js.isArray = isArray
 Js.truthy = truthy
 Js.typeOf = typeOf

@@ -197,6 +197,45 @@ function Bindings.create(web)
 				end
 				return list
 			end
+		elseif key == "getContext" then
+			return function(kind)
+				if tostring(kind):lower() ~= "2d" then
+					return nil
+				end
+				if node.__canvasContext then
+					return node.__canvasContext
+				end
+				local operations = {}
+				node.__canvasOps = operations
+				local context = { fillStyle = "#ffffff", strokeStyle = "#ffffff", lineWidth = 1 }
+				context.fillRect = function(x, y, width, height)
+					operations[#operations + 1] = {
+						x = tonumber(x) or 0,
+						y = tonumber(y) or 0,
+						width = tonumber(width) or 0,
+						height = tonumber(height) or 0,
+						color = tostring(context.fillStyle),
+					}
+					Dom.changed(node)
+				end
+				context.clearRect = function(x, y, width, height)
+					local left = tonumber(x) or 0
+					local top = tonumber(y) or 0
+					local right = left + (tonumber(width) or 0)
+					local bottom = top + (tonumber(height) or 0)
+					for index = #operations, 1, -1 do
+						local operation = operations[index]
+						local intersects = operation.x < right and operation.x + operation.width > left
+							and operation.y < bottom and operation.y + operation.height > top
+						if intersects then
+							table.remove(operations, index)
+						end
+					end
+					Dom.changed(node)
+				end
+				node.__canvasContext = context
+				return context
+			end
 		elseif key == "getAttribute" then
 			return function(name)
 				return node.attrs[tostring(name):lower()]
@@ -628,11 +667,38 @@ function Bindings.create(web)
 	local host = {
 		document = documentWrapper,
 		console = console,
+		RegExp = function(source, flags)
+			return Js.regex(tostring(source or ""), flags and tostring(flags) or "")
+		end,
+		Promise = {
+			__jsClass = true,
+			prototype = {},
+			constructor = function(executor)
+				return Js.promise(executor)
+			end,
+			resolve = function(value)
+				return Js.promiseResolve(value)
+			end,
+			reject = function(reason)
+				return Js.promiseReject(reason)
+			end,
+			all = function(list)
+				return Js.promiseAll(list)
+			end,
+			race = function(list)
+				return Js.promiseRace(list)
+			end,
+		},
 		Math = mathHost,
 		Object = objectHost,
 		Array = arrayHost,
 		Number = numberHost,
 		String = {
+			__jsClass = true,
+			prototype = {},
+			constructor = function(value)
+				return Js.toJsString(value)
+			end,
 			fromCharCode = function(...)
 				local parts = {}
 				for index = 1, select("#", ...) do

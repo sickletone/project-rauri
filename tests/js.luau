@@ -23,7 +23,7 @@ local web = Rauri.web.new({
 	chrome = false,
 	width = 320,
 	height = 200,
-	html = [[<div id="out"></div>]],
+	html = [[<div id="out"></div><canvas id="paint" width="100" height="50"></canvas>]],
 	js = [[
 const results = [];
 function add(name, value) { results.push(name + "=" + value); }
@@ -124,6 +124,40 @@ add("template", `n=${1 + 2}`);
 add("arrayApi", Array.isArray([1, 2]) + ":" + Array.from("ab").join(""));
 add("objectApi", Object.entries({ a: 1, b: 2 }).length);
 add("numberApi", Number.isInteger(3) + ":" + Number.parseInt("12px"));
+add("regex", "abc123".replace(/\d+/, "#") + ":" + /\d+/.test("x9"));
+add("regexGlobal", "a1b2".match(/\d/g).join(","));
+add("regexGroups", "2026-11-26".replace(/(\d+)-(\d+)-(\d+)/, "$3/$2/$1"));
+add("regexClass", "Hello World".match(/[A-Z]\w+/g).join("+"));
+add("regexSplit", "a, b;c".split(/[,;]\s*/).join("|"));
+add("regexExec", (() => { const found = /(\w+)@(\w+)/.exec("mail me@here now"); return found[1] + "/" + found[2] + "@" + found.index; })());
+add("regexFlags", /HELLO/i.test("hello"));
+
+function* counter() { let index = 0; while (index < 3) { yield index; index++; } }
+let total = 0;
+for (const value of counter()) { total += value; }
+add("generator", total);
+const iterator = (function* () { yield "a"; yield "b"; return "done"; })();
+add("generatorNext", iterator.next().value + iterator.next().value + ":" + iterator.next().done);
+
+async function sum() {
+  const first = await Promise.resolve(2);
+  const second = await 3;
+  return first + second;
+}
+const context = document.getElementById("paint").getContext("2d");
+context.fillStyle = "#ff0000";
+context.fillRect(2, 3, 24, 18);
+context.fillStyle = "#00ff00";
+context.fillRect(30, 3, 10, 10);
+
+sum().then((value) => {
+  document.getElementById("out").setAttribute("data-async", String(value));
+}).catch((error) => {
+  document.getElementById("out").setAttribute("data-async-err", String(error));
+});
+Promise.all([1, Promise.resolve(2), 3]).then((values) => {
+  document.getElementById("out").setAttribute("data-all", values.join("-"));
+});
 
 document.getElementById("out").textContent = results.join(";");
 ]],
@@ -166,9 +200,27 @@ local expected = table.concat({
 	"arrayApi=true:ab",
 	"objectApi=2",
 	"numberApi=true:12",
+	"regex=abc#:true",
+	"regexGlobal=1,2",
+	"regexGroups=26/11/2026",
+	"regexClass=Hello+World",
+	"regexSplit=a|b|c",
+	"regexExec=me/here@5",
+	"regexFlags=true",
+	"generator=3",
+	"generatorNext=ab:true",
 }, ";")
 
 check(text == expected, "language features produce expected output\n  got:      " .. text .. "\n  expected: " .. expected)
+
+Mock.drain()
+check(Rauri.web.dom.getAttribute(out, "data-async") == "5", "async/await resolves promises: " .. tostring(Rauri.web.dom.getAttribute(out, "data-async")))
+check(Rauri.web.dom.getAttribute(out, "data-all") == "1-2-3", "Promise.all preserves order: " .. tostring(Rauri.web.dom.getAttribute(out, "data-all")))
+
+local canvasNode = Rauri.web.dom.query(web.document, "#paint")
+local operations = canvasNode and canvasNode.__canvasOps or {}
+check(#operations == 2, "canvas 2d fillRect records drawing operations")
+check(operations[1] ~= nil and operations[1].width == 24 and operations[1].color == "#ff0000", "canvas fillStyle and geometry are stored")
 
 print(string.format("%d passed, %d failed", passed, failed))
 if failed > 0 then

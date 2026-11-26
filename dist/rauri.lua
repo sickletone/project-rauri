@@ -3014,7 +3014,7 @@ local Platform = __require("src/shared/Rauri/platform")
 local Web = {}
 Web.__index = Web
 
-Web.version = "0.2.0"
+Web.version = "0.3.1"
 
 local BASE_CSS = [[
 * { box-sizing: border-box; }
@@ -3156,6 +3156,30 @@ local DEFAULT_VARS = {
 	["--radius"] = "12px",
 }
 
+local function transitionFields(prop)
+	if prop == "all" then
+		return { "color", "background", "opacity" }
+	elseif prop == "color" or prop == "opacity" then
+		return { prop }
+	elseif prop == "background" or prop == "background-color" then
+		return { "background", "backgroundAlpha" }
+	end
+	return {}
+end
+
+local transitionCache = {}
+local function transitionSpec(value)
+	if not value then
+		return nil
+	end
+	local cached = transitionCache[value]
+	if not cached then
+		cached = Css.parseTransition(value)
+		transitionCache[value] = cached
+	end
+	return cached
+end
+
 local function chromeMarkup(title, body)
 	return string.format([[
 <div class="rauri-window">
@@ -3193,6 +3217,10 @@ function Web.new(config)
 	self.toastCounter = 0
 	self.closed = false
 	self.vars = {}
+	self.transitions = {}
+	self.pendingTransitions = {}
+	self.animationLoopRunning = false
+	self.animationInUse = false
 
 	for name, value in DEFAULT_VARS do
 		self.vars[name] = value
@@ -3279,6 +3307,8 @@ function Web:rebuildStyles()
 	local css = BASE_CSS .. "\n" .. self:themeCss() .. "\n" .. self.styleTags .. "\n" .. (self.config.css or "")
 	self.stylesheet = Css.parse(css, { width = self.width })
 	self.hoverable = css:find(":hover", 1, true) ~= nil
+	self.hasAnimations = css:find("@keyframes", 1, true) ~= nil
+		and (css:find("animation%s*:") ~= nil or css:find("animation%-name%s*:") ~= nil)
 end
 
 function Web:invalidate()
@@ -3348,6 +3378,171 @@ function Web:start()
 			self:log(err)
 		end
 	end
+
+	if self.hasAnimations and self.config.animations ~= false then
+		self.animationStart = os.clock()
+		self.animationTime = 0
+		self.animationInUse = true
+		self:ensureAnimationLoop()
+	end
+end
+
+function Web:ensureAnimationLoop()
+	if self.animationLoopRunning or self.closed then
+		return
+	end
+	if self.config.animations == false and next(self.transitions) == nil then
+		return
+	end
+	self.animationLoopRunning = true
+	-- Defer so starting a transition during a view never re-enters that view.
+	task.defer(function()
+		while not self.closed do
+			local hasTransitions = next(self.transitions) ~= nil
+			local hasAnimation = self.animationInUse and self.config.animations ~= false
+			if not hasTransitions and not hasAnimation then
+				break
+			end
+			if hasAnimation and self.animationStart then
+				self.animationTime = os.clock() - self.animationStart
+			end
+			self:invalidate()
+			task.wait(1 / 30)
+		end
+		self.animationLoopRunning = false
+	end)
+end
+
+function Web:captureTransition(node)
+	if self.config.transitions == false then
+		return
+	end
+	local box = self:boxOf(node)
+	local style = box and box.style
+	if not style then
+		return
+	end
+	self.pendingTransitions[node.id] = {
+		color = style.color,
+		background = style.background,
+		backgroundAlpha = style.backgroundAlpha,
+		opacity = style.opacity,
+	}
+end
+
+function Web:startPendingTransitions(computed)
+	if next(self.pendingTransitions) == nil then
+		return
+	end
+	local now = os.clock()
+	local started = false
+	for nodeId, snapshot in self.pendingTransitions do
+		local style = computed[nodeId]
+		local spec = style and transitionSpec(style.transition)
+		if spec and next(spec) then
+			local durations = {}
+			for prop, seconds in spec do
+				for _, field in transitionFields(prop) do
+					if durations[field] == nil or prop ~= "all" then
+						durations[field] = seconds
+					end
+				end
+			end
+			local entries = self.transitions[nodeId] or {}
+			for field, seconds in durations do
+				local from = snapshot[field]
+				local target = style[field]
+				if seconds > 0 and from ~= nil and target ~= nil and from ~= target then
+					entries[field] = { from = from, start = now, duration = seconds }
+				end
+			end
+			if next(entries) then
+				self.transitions[nodeId] = entries
+				started = true
+			end
+		end
+	end
+	self.pendingTransitions = {}
+	if started then
+		self:ensureAnimationLoop()
+	end
+end
+
+function Web:applyTransitions(computed)
+	if next(self.transitions) == nil then
+		return
+	end
+	local now = os.clock()
+	for nodeId, entries in self.transitions do
+		local style = computed[nodeId]
+		if not style then
+			self.transitions[nodeId] = nil
+		else
+			local remaining = false
+			for field, entry in entries do
+				local progress = (now - entry.start) / entry.duration
+				if progress >= 1 then
+					entries[field] = nil
+				else
+					remaining = true
+					local target = style[field]
+					if target ~= nil then
+						style[field] = Css.blendValue(entry.from, target, progress)
+					end
+				end
+			end
+			if not remaining then
+				self.transitions[nodeId] = nil
+			end
+		end
+	end
+end
+
+function Web:animate(node, name, duration, options)
+	options = options or {}
+	if not node or not self.stylesheet then
+		return
+	end
+	duration = math.max(0.001, tonumber(duration) or 0.3)
+	local steps = math.max(1, tonumber(options.steps) or 20)
+	local iterations = tonumber(options.iterations) or (options.loop and math.huge or 1)
+	task.spawn(function()
+		for _ = 1, iterations do
+			for step = 0, steps do
+				if self.closed then
+					return
+				end
+				local values = Css.sampleKeyframes(self.stylesheet, name, step / steps)
+				for prop, value in values or {} do
+					Dom.setStyle(node, prop, value)
+				end
+				self:invalidate()
+				task.wait(duration / steps)
+			end
+		end
+	end)
+end
+
+function Web:playAudio(node)
+	local source = node and node.attrs and node.attrs.src
+	if not source or source == "" then
+		return
+	end
+	local ok = pcall(function()
+		local sound = Instance.new("Sound")
+		sound.SoundId = source
+		sound.Volume = 0.5
+		sound.Parent = game:GetService("SoundService")
+		sound:Play()
+		task.delay(30, function()
+			if sound then
+				sound:Destroy()
+			end
+		end)
+	end)
+	if not ok then
+		self:log("audio: could not play " .. tostring(source))
+	end
 end
 
 function Web:notify(message, duration)
@@ -3372,6 +3567,7 @@ function Web:setHover(node, hovered)
 	if node.state.hover == hovered then
 		return
 	end
+	self:captureTransition(node)
 	node.state.hover = hovered
 	self:invalidate()
 end
@@ -3608,7 +3804,18 @@ function Web:view()
 	end
 
 	self.boxById = {}
-	local computed = Css.compute(self.document, self.stylesheet, {})
+	local computed = Css.compute(self.document, self.stylesheet, { animationTime = self.animationTime })
+	self:startPendingTransitions(computed)
+	self:applyTransitions(computed)
+	if self.hasAnimations then
+		self.animationInUse = false
+		for _, style in computed do
+			if style.animationName then
+				self.animationInUse = true
+				break
+			end
+		end
+	end
 	local root = Layout.build(self.document, computed, self.width, self.height)
 	self:indexBoxes(root)
 
@@ -4176,6 +4383,9 @@ local TAG_DISPLAY = {
 	pre = "block",
 	blockquote = "block",
 	span = "inline",
+	canvas = "inline-block",
+	video = "inline-block",
+	audio = "inline-block",
 	a = "inline",
 	b = "inline",
 	strong = "inline",
@@ -4588,18 +4798,26 @@ local function parseCompound(text)
 				nextIndex = close + 1
 			end
 		elseif ch == ":" then
-			local name
-			name, nextIndex = text:match("^:([%w_%-]+)()", index)
-			if name then
-				local pseudo = { name = name:lower() }
-				if text:sub(nextIndex, nextIndex) == "(" then
-					local close = text:find(")", nextIndex, true)
-					if close then
-						pseudo.arg = text:sub(nextIndex + 1, close - 1)
-						nextIndex = close + 1
-					end
+			if text:sub(index + 1, index + 1) == ":" then
+				local name
+				name, nextIndex = text:match("^::([%w_%-]+)()", index)
+				if name then
+					compound.pseudoElement = name:lower()
 				end
-				compound.pseudos[#compound.pseudos + 1] = pseudo
+			else
+				local name
+				name, nextIndex = text:match("^:([%w_%-]+)()", index)
+				if name then
+					local pseudo = { name = name:lower() }
+					if text:sub(nextIndex, nextIndex) == "(" then
+						local close = text:find(")", nextIndex, true)
+						if close then
+							pseudo.arg = text:sub(nextIndex + 1, close - 1)
+							nextIndex = close + 1
+						end
+					end
+					compound.pseudos[#compound.pseudos + 1] = pseudo
+				end
 			end
 		else
 			local name
@@ -4682,6 +4900,9 @@ local function specificityOf(parts)
 		end
 		classes += #compound.classes + #compound.attrs + #compound.pseudos
 		if compound.tag and compound.tag ~= "*" then
+			tags += 1
+		end
+		if compound.pseudoElement then
 			tags += 1
 		end
 	end
@@ -4916,6 +5137,7 @@ function Css.parseSelector(text)
 			selectors[#selectors + 1] = {
 				parts = parts,
 				specificity = specificityOf(parts),
+				pseudoElement = parts[#parts].compound.pseudoElement,
 				text = chunk,
 			}
 		end
@@ -4941,6 +5163,7 @@ function Css.parse(source, options)
 	options = options or {}
 	local viewportWidth = options.width or 1e6
 	local rules = {}
+	local keyframes = {}
 	local order = 0
 	local text = tostring(source or ""):gsub("/%*.-%*/", "")
 
@@ -4967,6 +5190,36 @@ function Css.parse(source, options)
 		index = cursor
 
 		if selectorText:sub(1, 1) == "@" then
+			local keyframeName = selectorText:match("^@keyframes%s+([%w_%-]+)$")
+			if keyframeName then
+				local frames = {}
+				local frameIndex = 1
+				while frameIndex <= #body do
+					local frameOpen = body:find("{", frameIndex, true)
+					if not frameOpen then
+						break
+					end
+					local label = body:sub(frameIndex, frameOpen - 1):gsub("^%s+", ""):gsub("%s+$", "")
+					local frameClose = body:find("}", frameOpen, true) or #body
+					local percent = tonumber(label:match("([%d%.]+)"))
+					if label == "from" then
+						percent = 0
+					elseif label == "to" then
+						percent = 100
+					end
+					if percent then
+						frames[#frames + 1] = {
+							percent = percent,
+							declarations = parseDeclarations(body:sub(frameOpen + 1, frameClose - 1)),
+						}
+					end
+					frameIndex = frameClose + 1
+				end
+				table.sort(frames, function(a, b)
+					return a.percent < b.percent
+				end)
+				keyframes[keyframeName] = frames
+			else
 			local condition = selectorText:match("^@media%s*(.+)$")
 			if condition then
 				local applies = true
@@ -4987,7 +5240,11 @@ function Css.parse(source, options)
 						rule.order = order
 						rules[#rules + 1] = rule
 					end
+					for name, frames in nested.keyframes or {} do
+						keyframes[name] = frames
+					end
 				end
+			end
 			end
 		else
 			order += 1
@@ -4998,7 +5255,7 @@ function Css.parse(source, options)
 			}
 		end
 	end
-	return { rules = rules }
+	return { rules = rules, keyframes = keyframes }
 end
 
 -- Computed styles -------------------------------------------------------
@@ -5027,6 +5284,11 @@ local DEFAULT_STYLE = {
 	justifyItems = "stretch",
 	order = 0,
 	aspectRatio = nil,
+	float = "none",
+	content = nil,
+	transition = nil,
+	animation = nil,
+	animationName = nil,
 	whiteSpace = "normal",
 	textTransform = "none",
 	visibility = "visible",
@@ -5318,6 +5580,20 @@ local function applyDeclaration(style, declaration, context)
 		style.left = Css.length(value, fontSize, rootFontSize)
 	elseif prop == "cursor" then
 		style.cursor = value
+	elseif prop == "float" then
+		style.float = value
+	elseif prop == "content" then
+		style.content = value
+	elseif prop == "transition" then
+		style.transition = value
+	elseif prop == "animation" then
+		style.animation = value
+		local name = value:match("^%s*([%w_%-]+)")
+		if name and name ~= "none" then
+			style.animationName = name
+		end
+	elseif prop == "animation-name" then
+		style.animationName = value
 	end
 end
 
@@ -5339,7 +5615,7 @@ local function collectDeclarations(node, stylesheet, inlineCache)
 	for _, rule in stylesheet.rules do
 		local best = -1
 		for _, selector in rule.selectors do
-			if matchParts(node, selector.parts, #selector.parts, stylesheet.root) then
+			if not selector.pseudoElement and matchParts(node, selector.parts, #selector.parts, stylesheet.root) then
 				if selector.specificity > best then
 					best = selector.specificity
 				end
@@ -5380,6 +5656,51 @@ local function collectDeclarations(node, stylesheet, inlineCache)
 	return declarations
 end
 
+local function collectPseudoDeclarations(node, stylesheet, which)
+	local matched = {}
+	for _, rule in stylesheet.rules do
+		local best = -1
+		for _, selector in rule.selectors do
+			if selector.pseudoElement == which and matchParts(node, selector.parts, #selector.parts, stylesheet.root) then
+				if selector.specificity > best then
+					best = selector.specificity
+				end
+			end
+		end
+		if best >= 0 then
+			matched[#matched + 1] = { rule = rule, specificity = best, order = rule.order }
+		end
+	end
+	table.sort(matched, function(a, b)
+		if a.specificity == b.specificity then
+			return a.order < b.order
+		end
+		return a.specificity < b.specificity
+	end)
+	local declarations = {}
+	for _, entry in matched do
+		for _, declaration in entry.rule.declarations do
+			declarations[#declarations + 1] = declaration
+		end
+	end
+	return declarations
+end
+
+local function resolvePseudoContent(value, node)
+	if not value then
+		return nil
+	end
+	local quoted = value:match('^"(.*)"$') or value:match("^'(.*)'$")
+	if quoted then
+		return quoted
+	end
+	local attribute = value:match("^attr%s*%(%s*([%w_%-]+)%s*%)$")
+	if attribute then
+		return node.attrs[attribute:lower()] or ""
+	end
+	return nil
+end
+
 function Css.compute(document, stylesheet, options)
 	options = options or {}
 	local rootFontSize = options.rootFontSize or 16
@@ -5412,7 +5733,37 @@ function Css.compute(document, stylesheet, options)
 		for _, declaration in declarations do
 			applyDeclaration(style, declaration, context)
 		end
+		if options.animationTime and style.animationName and stylesheet.keyframes then
+			local duration = tostring(style.animation or ""):match("([%d%.]+)%s*(m?s)")
+			if duration then
+				duration = tonumber(duration) or 1
+				if style.animation:find("ms", 1, true) then
+					duration /= 1000
+				end
+			end
+			duration = math.max(0.001, duration or 1)
+			local progress = (options.animationTime / duration) % 1
+			local sampled = Css.sampleKeyframes(stylesheet, style.animationName, progress)
+			for prop, value in sampled or {} do
+				applyDeclaration(style, { prop = prop, value = value }, context)
+			end
+		end
 		computed[node.id] = style
+
+		for _, which in { "before", "after" } do
+			local pseudoDeclarations = collectPseudoDeclarations(node, stylesheet, which)
+			if #pseudoDeclarations > 0 then
+				local pseudoStyle = inheritedStyle(style)
+				pseudoStyle.display = "inline"
+				pseudoStyle.position = "static"
+				local pseudoContext = { vars = vars, parentStyle = style, rootFontSize = rootFontSize }
+				for _, declaration in pseudoDeclarations do
+					applyDeclaration(pseudoStyle, declaration, pseudoContext)
+				end
+				pseudoStyle.content = resolvePseudoContent(pseudoStyle.content, node)
+				computed[node.id .. "::" .. which] = pseudoStyle
+			end
+		end
 
 		for _, child in node.children do
 			if child.type == "element" then
@@ -5425,6 +5776,98 @@ function Css.compute(document, stylesheet, options)
 		walk(document.body, nil, {})
 	end
 	return computed
+end
+
+function Css.sampleKeyframes(stylesheet, name, progress)
+	local frames = stylesheet and stylesheet.keyframes and stylesheet.keyframes[name]
+	if not frames or #frames == 0 then
+		return nil
+	end
+	progress = clamp01(tonumber(progress) or 0) * 100
+	local before, after = frames[1], frames[#frames]
+	for _, frame in frames do
+		if frame.percent <= progress then
+			before = frame
+		end
+		if frame.percent >= progress then
+			after = frame
+			break
+		end
+	end
+	local span = after.percent - before.percent
+	local t = span > 0 and (progress - before.percent) / span or 1
+	local function frameValue(frame, prop)
+		for _, declaration in frame.declarations do
+			if declaration.prop == prop then
+				return declaration.value
+			end
+		end
+		return nil
+	end
+	local props = {}
+	for _, frame in { before, after } do
+		for _, declaration in frame.declarations do
+			props[declaration.prop] = true
+		end
+	end
+	local result = {}
+	for prop in props do
+		local a = frameValue(before, prop) or frameValue(after, prop)
+		local b = frameValue(after, prop) or a
+		if a and b then
+			local na, nb = tonumber(a), tonumber(b)
+			if na and nb then
+				result[prop] = tostring(na + (nb - na) * t)
+			else
+				local colorA = Css.color(a)
+				local colorB = Css.color(b)
+				if colorA and colorB then
+					local red = colorA.R + (colorB.R - colorA.R) * t
+					local green = colorA.G + (colorB.G - colorA.G) * t
+					local blue = colorA.B + (colorB.B - colorA.B) * t
+					result[prop] = string.format("#%02x%02x%02x", math.floor(red * 255 + 0.5), math.floor(green * 255 + 0.5), math.floor(blue * 255 + 0.5))
+				else
+					result[prop] = t < 0.5 and a or b
+				end
+			end
+		end
+	end
+	return result
+end
+
+-- transition: property duration[, ...] -- durations in seconds.
+function Css.parseTransition(value)
+	local spec = {}
+	for part in tostring(value or ""):gmatch("[^,]+") do
+		local prop = part:match("^%s*([%w%-]+)")
+		local amount, unit = part:match("([%d%.]+)%s*(m?s)")
+		if prop and prop:match("^[%d%.]+$") then
+			prop = "all"
+		end
+		if prop and amount then
+			local seconds = tonumber(amount) or 0
+			if unit == "ms" then
+				seconds /= 1000
+			end
+			spec[prop:lower()] = seconds
+		end
+	end
+	return spec
+end
+
+function Css.blendValue(from, to, progress)
+	progress = clamp01(progress)
+	if type(from) == "number" and type(to) == "number" then
+		return from + (to - from) * progress
+	end
+	if typeof(from) == "Color3" and typeof(to) == "Color3" then
+		return Color3.new(
+			from.R + (to.R - from.R) * progress,
+			from.G + (to.G - from.G) * progress,
+			from.B + (to.B - from.B) * progress
+		)
+	end
+	return progress < 0.5 and from or to
 end
 
 Css.DEFAULT_STYLE = DEFAULT_STYLE
@@ -5795,6 +6238,13 @@ local function naturalContentWidth(node, style, computed, maxWidth)
 	if node.attrs and node.attrs["data-icon"] then
 		return math.min(style.fontSize, maxWidth)
 	end
+	if node.tag == "canvas" then
+		return math.min(tonumber(node.attrs and node.attrs.width) or 300, maxWidth)
+	elseif node.tag == "video" then
+		return math.min(tonumber(node.attrs and node.attrs.width) or 320, maxWidth)
+	elseif node.tag == "audio" then
+		return math.min(120, maxWidth)
+	end
 	local inner = 0
 	for _, child in node.children do
 		if child.type == "element" then
@@ -5828,6 +6278,13 @@ local function intrinsicContentWidth(node, style, computed, maxWidth)
 	end
 	if node.attrs and node.attrs["data-icon"] then
 		return math.min(style.fontSize, maxWidth)
+	end
+	if node.tag == "canvas" then
+		return math.min(tonumber(node.attrs and node.attrs.width) or 300, maxWidth)
+	elseif node.tag == "video" then
+		return math.min(tonumber(node.attrs and node.attrs.width) or 320, maxWidth)
+	elseif node.tag == "audio" then
+		return math.min(120, maxWidth)
 	end
 	local inner = 0
 	for _, child in node.children do
@@ -5879,9 +6336,18 @@ end
 
 local layoutElement
 local computedRef
+local viewportWidth = 0
+local viewportHeight = 0
 
 local function visibleEntries(node, computed)
 	local entries = {}
+	local before = computed[node.id .. "::before"]
+	if before and before.content and before.content ~= "" then
+		entries[#entries + 1] = {
+			child = { type = "text", text = before.content, id = node.id .. "-before" },
+			style = before,
+		}
+	end
 	for _, child in node.children do
 		if child.type == "element" then
 			local style = computed[child.id]
@@ -5894,6 +6360,13 @@ local function visibleEntries(node, computed)
 				entries[#entries + 1] = { child = child, style = nil }
 			end
 		end
+	end
+	local after = computed[node.id .. "::after"]
+	if after and after.content and after.content ~= "" then
+		entries[#entries + 1] = {
+			child = { type = "text", text = after.content, id = node.id .. "-after" },
+			style = after,
+		}
 	end
 	return entries
 end
@@ -5910,7 +6383,7 @@ end
 local function layoutInline(entries, containerStyle, computed, contentX, contentY, contentWidth)
 	local allText = true
 	for _, entry in entries do
-		if entry.child.type ~= "text" then
+		if entry.child.type ~= "text" or entry.style then
 			allText = false
 			break
 		end
@@ -5948,11 +6421,13 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 		if child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				local shown = displayText(text, containerStyle)
-				local width, height = measure(shown, containerStyle, 1e6)
+				local textStyle = entry.style or containerStyle
+				local shown = displayText(text, textStyle)
+				local width, height = measure(shown, textStyle, 1e6)
 				items[#items + 1] = {
 					kind = "text",
 					node = child,
+					style = textStyle,
 					text = shown,
 					width = width,
 					height = height,
@@ -6019,7 +6494,7 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 			if item.kind == "text" then
 				boxes[#boxes + 1] = textBox(
 					item.node,
-					containerStyle,
+					item.style or containerStyle,
 					contentX + offset,
 					contentY + cursorY,
 					item.width,
@@ -6368,78 +6843,175 @@ end
 local function layoutGrid(node, entries, style, computed, contentX, contentY, contentWidth, contentHeight)
 	local gap = Css.resolve(style.gap, contentWidth, 0) or 0
 	local columns = resolveTracks(style.gridTemplateColumns, contentWidth, gap)
-	local absolute = {}
-	local flow = {}
+	local columnCount = math.max(1, #columns)
+	local absolute, fixed, flow = {}, {}, {}
 	for _, entry in entries do
-		if entry.child.type == "element" and entry.style.position == "absolute" then
+		local child = entry.child
+		if child.type == "element" and entry.style.position == "fixed" then
+			fixed[#fixed + 1] = entry
+		elseif child.type == "element" and entry.style.position == "absolute" then
 			absolute[#absolute + 1] = entry
-		elseif entry.child.type == "element" and entry.child.tag == "br" then
+		elseif child.type == "element" and child.tag == "br" then
 			-- ignore
-		elseif entry.child.type == "text" and normalizeText(entry.child.text) == "" then
+		elseif child.type == "text" and normalizeText(child.text) == "" then
 			-- whitespace between cells is not a grid item
 		else
 			flow[#flow + 1] = entry
 		end
 	end
 
-	local rows = {}
-	local cursor = 1
-	while cursor <= #flow do
-		local row = {}
-		local height = 0
-		for column = 1, #columns do
-			local entry = flow[cursor]
-			if not entry then
-				break
-			end
-			cursor += 1
-			local child = entry.child
-			local childStyle = entry.style
-			if child.type == "text" then
-				local text = normalizeText(child.text)
-				if text ~= "" then
-					local shown = displayText(text, style)
-					local width, measured = measure(shown, style, columns[column])
-					row[#row + 1] = { kind = "text", node = child, style = style, text = shown, width = math.min(width, columns[column]), height = measured, column = column }
-					height = math.max(height, measured)
+	local placements = {}
+	local occupied = {}
+	local row, column = 1, 1
+	local function canPlace(atRow, atColumn, spanX, spanY)
+		if atColumn + spanX - 1 > columnCount then
+			return false
+		end
+		for checkRow = atRow, atRow + spanY - 1 do
+			for checkColumn = atColumn, atColumn + spanX - 1 do
+				if occupied[checkRow] and occupied[checkRow][checkColumn] then
+					return false
 				end
-			else
-				local width = Css.resolve(childStyle.width, columns[column], nil) or columns[column]
-				local box = layoutElement(child, childStyle, 0, 0, width, nil, width, nil)
-				row[#row + 1] = { kind = "element", box = box, width = width, height = box.height, column = column }
-				height = math.max(height, box.height)
 			end
 		end
-		rows[#rows + 1] = { items = row, height = height }
+		return true
+	end
+
+	for _, entry in flow do
+		local child = entry.child
+		local childStyle = entry.style
+		local spanX, spanY = 1, 1
+		if child.type == "element" then
+			spanX = math.max(1, math.min(columnCount, childStyle.gridColumnSpan or 1))
+			spanY = math.max(1, childStyle.gridRowSpan or 1)
+		end
+		while not canPlace(row, column, spanX, spanY) do
+			column += 1
+			if column + spanX - 1 > columnCount then
+				column = 1
+				row += 1
+			end
+		end
+		placements[#placements + 1] = {
+			entry = entry,
+			row = row,
+			column = column,
+			spanX = spanX,
+			spanY = spanY,
+		}
+		for markRow = row, row + spanY - 1 do
+			occupied[markRow] = occupied[markRow] or {}
+			for markColumn = column, column + spanX - 1 do
+				occupied[markRow][markColumn] = true
+			end
+		end
+		column += spanX
+		if column > columnCount then
+			column = 1
+			row += 1
+		end
+	end
+
+	local columnOffsets = {}
+	local offset = 0
+	for index = 1, columnCount do
+		columnOffsets[index] = offset
+		offset += columns[index] + gap
+	end
+
+	local function spanWidth(placement)
+		local first = placement.column
+		local last = placement.column + placement.spanX - 1
+		return columnOffsets[last] + columns[last] - columnOffsets[first] + gap * (placement.spanX - 1)
+	end
+
+	local rowCount = 1
+	for _, placement in placements do
+		rowCount = math.max(rowCount, placement.row + placement.spanY - 1)
+	end
+	local rowHeights = {}
+	for index = 1, rowCount do
+		rowHeights[index] = 0
+	end
+
+	for _, placement in placements do
+		local entry = placement.entry
+		local child, childStyle = entry.child, entry.style
+		local width = spanWidth(placement)
+		if child.type == "text" then
+			local textStyle = childStyle or style
+			local shown = displayText(normalizeText(child.text), textStyle)
+			local _, measured = measure(shown, textStyle, width)
+			placement.text = shown
+			placement.textStyle = textStyle
+			placement.width = width
+			placement.height = measured
+		else
+			local explicit = Css.resolve(childStyle.width, width, nil)
+			local itemWidth = explicit or width
+			local box = layoutElement(child, childStyle, 0, 0, itemWidth, nil, itemWidth, nil)
+			placement.box = box
+			placement.width = itemWidth
+			placement.height = box.height
+			if childStyle.position == "sticky" then
+				local top = Css.resolve(childStyle.top, contentHeight, nil)
+				local left = Css.resolve(childStyle.left, itemWidth, nil)
+				placement.stickyX = left or 0
+				placement.stickyY = top or 0
+			end
+		end
+		if placement.spanY == 1 and placement.height > rowHeights[placement.row] then
+			rowHeights[placement.row] = placement.height
+		end
+	end
+	for _, placement in placements do
+		if placement.spanY > 1 then
+			local first = placement.row
+			local last = placement.row + placement.spanY - 1
+			local available = gap * (placement.spanY - 1)
+			for index = first, last do
+				available += rowHeights[index]
+			end
+			if available < placement.height then
+				rowHeights[last] += placement.height - available
+			end
+		end
+	end
+
+	local rowOffsets = {}
+	offset = 0
+	for index = 1, rowCount do
+		rowOffsets[index] = offset
+		offset += rowHeights[index] + gap
 	end
 
 	local boxes = {}
-	local y = 0
-	for index, row in rows do
-		local rowHeight = row.height
-		local explicit = style.gridTemplateRows and style.gridTemplateRows[index]
-		if explicit then
-			local size = Css.resolve(explicit.length, contentHeight, rowHeight) or rowHeight
-			rowHeight = math.max(rowHeight, size)
-		end
-		local x = 0
-		for _, cell in row.items do
-			if cell.kind == "text" then
-				boxes[#boxes + 1] = textBox(cell.node, cell.style, contentX + x, contentY + y, cell.width, cell.height, cell.text)
-			else
-				local box = cell.box
-				if math.abs(box.height - rowHeight) > 0.01 and Css.resolve(box.style.height, contentHeight, nil) == nil then
-					box = layoutElement(box.node, box.style, 0, 0, cell.width, rowHeight, cell.width, rowHeight)
-				end
-				shiftBox(box, contentX + x, contentY + y)
-				boxes[#boxes + 1] = box
+	for _, placement in placements do
+		local x = contentX + columnOffsets[placement.column] + (placement.stickyX or 0)
+		local y = contentY + rowOffsets[placement.row] + (placement.stickyY or 0)
+		if placement.box then
+			local box = placement.box
+			local cellHeight = rowHeights[placement.row]
+			if placement.spanY > 1 then
+				local last = placement.row + placement.spanY - 1
+				cellHeight = rowOffsets[last] + rowHeights[last] - rowOffsets[placement.row]
 			end
-			x += columns[cell.column] + gap
+			if math.abs(box.height - cellHeight) > 0.01 and Css.resolve(box.style.height, cellHeight, nil) == nil then
+				box = layoutElement(box.node, box.style, 0, 0, placement.width, cellHeight, placement.width, cellHeight)
+				placement.box = box
+			end
+			shiftBox(box, x, y)
+			boxes[#boxes + 1] = box
+		else
+			boxes[#boxes + 1] = textBox(placement.entry.child, placement.textStyle, x, y, placement.width, placement.height, placement.text)
 		end
-		y += rowHeight + gap
 	end
 
-	return boxes, math.max(0, y - gap), absolute
+	local totalHeight = 0
+	if rowCount > 0 then
+		totalHeight = rowOffsets[rowCount] + rowHeights[rowCount]
+	end
+	return boxes, totalHeight, absolute, fixed
 end
 
 -- Block flow -------------------------------------------------------------
@@ -6447,6 +7019,7 @@ end
 local function layoutBlock(entries, containerStyle, computed, contentX, contentY, contentWidth, contentHeightAvailable)
 	local boxes = {}
 	local absolute = {}
+	local fixed = {}
 	local cursorY = 0
 
 	for _, entry in entries do
@@ -6454,16 +7027,28 @@ local function layoutBlock(entries, containerStyle, computed, contentX, contentY
 		if child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				local shown = displayText(text, containerStyle)
-				local limit = containerStyle.whiteSpace == "nowrap" and 1e6 or contentWidth
-				local width, height = measure(shown, containerStyle, limit)
-				boxes[#boxes + 1] = textBox(child, containerStyle, contentX, contentY + cursorY, width, height, shown)
+				local textStyle = entry.style or containerStyle
+				local shown = displayText(text, textStyle)
+				local limit = textStyle.whiteSpace == "nowrap" and 1e6 or contentWidth
+				local width, height = measure(shown, textStyle, limit)
+				boxes[#boxes + 1] = textBox(child, textStyle, contentX, contentY + cursorY, width, height, shown)
 				cursorY += height
 			end
 		elseif child.tag == "br" then
 			cursorY += containerStyle.fontSize * (containerStyle.lineHeight or 1.3)
+		elseif childStyle.position == "fixed" then
+			fixed[#fixed + 1] = entry
 		elseif childStyle.position == "absolute" then
 			absolute[#absolute + 1] = entry
+		elseif childStyle.float == "left" or childStyle.float == "right" then
+			-- Floats sit on the current line at the chosen edge; following block
+			-- content continues below them (text does not wrap around floats).
+			local width = Css.resolve(childStyle.width, contentWidth, nil)
+				or math.min(contentWidth, naturalContentWidth(child, childStyle, computed, contentWidth) + horizontalInsets(childStyle))
+			local x = childStyle.float == "right" and (contentWidth - width) or 0
+			local box = layoutElement(child, childStyle, contentX + x, contentY + cursorY, width, nil, width, nil)
+			boxes[#boxes + 1] = box
+			cursorY = math.max(cursorY, box.y + box.height - contentY)
 		else
 			local marginTop = sideMargin(childStyle, "Top", contentWidth)
 			local marginBottom = sideMargin(childStyle, "Bottom", contentWidth)
@@ -6481,10 +7066,43 @@ local function layoutBlock(entries, containerStyle, computed, contentX, contentY
 				remaining
 			)
 			boxes[#boxes + 1] = box
+			if childStyle.position == "sticky" then
+				local top = Css.resolve(childStyle.top, contentHeightAvailable, nil)
+				local left = Css.resolve(childStyle.left, contentWidth, nil)
+				if top or left then
+					shiftBox(box, left or 0, top or 0)
+				end
+			end
 			cursorY = box.y + box.height - contentY + marginBottom
 		end
 	end
-	return boxes, cursorY, absolute
+	return boxes, cursorY, absolute, fixed
+end
+
+local function layoutFixed(parentBox, entries, computed)
+	local viewWidth = viewportWidth > 0 and viewportWidth or 760
+	local viewHeight = viewportHeight > 0 and viewportHeight or 520
+	for _, entry in entries do
+		local child, style = entry.child, entry.style
+		local width = Css.resolve(style.width, viewWidth, nil)
+		local height = Css.resolve(style.height, viewHeight, nil)
+		local left = Css.resolve(style.left, viewWidth, nil)
+		local right = Css.resolve(style.right, viewWidth, nil)
+		local top = Css.resolve(style.top, viewHeight, nil)
+		local bottom = Css.resolve(style.bottom, viewHeight, nil)
+		if not width then
+			width = naturalContentWidth(child, style, computed, viewWidth) + horizontalInsets(style)
+		end
+		local box = layoutElement(child, style, 0, 0, width, height, width, height)
+		if not height then
+			height = box.height
+		end
+		local x = left or (right and (viewWidth - width - right)) or 0
+		local y = top or (bottom and (viewHeight - height - bottom)) or 0
+		shiftBox(box, x, y)
+		box.fixed = true
+		parentBox.children[#parentBox.children + 1] = box
+	end
 end
 
 local function layoutAbsolute(parentBox, absolute, computed)
@@ -6520,6 +7138,11 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	local vertical = padTop + padBottom + border * 2
 
 	local widthSpec = forcedWidth or Css.resolve(style.width, availableWidth, nil)
+	if not widthSpec and node.tag == "canvas" then
+		widthSpec = tonumber(node.attrs and node.attrs.width) or 300
+	elseif not widthSpec and node.tag == "video" then
+		widthSpec = tonumber(node.attrs and node.attrs.width) or 320
+	end
 	local contentWidth
 	local borderBoxWidth
 	if widthSpec then
@@ -6556,6 +7179,7 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	local children = {}
 	local contentHeight = 0
 	local absolute = {}
+	local fixed = {}
 
 	if node.attrs and node.attrs["data-icon"] then
 		-- An icon has no children; its font-size is its box size.
@@ -6574,7 +7198,7 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 		)
 	elseif style.display == "grid" then
 		local entries = visibleEntries(node, computedRef)
-		children, contentHeight, absolute = layoutGrid(
+		children, contentHeight, absolute, fixed = layoutGrid(
 			node,
 			entries,
 			style,
@@ -6596,7 +7220,7 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 		if not hasBlock then
 			children, contentHeight = layoutInline(entries, style, computedRef, contentX, contentY, contentWidth)
 		else
-			children, contentHeight, absolute = layoutBlock(
+			children, contentHeight, absolute, fixed = layoutBlock(
 				entries,
 				style,
 				computedRef,
@@ -6609,6 +7233,9 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	end
 
 	local heightSpec = forcedHeight or Css.resolve(style.height, availableHeight, nil)
+	if not heightSpec and node.tag == "canvas" then
+		heightSpec = tonumber(node.attrs and node.attrs.height) or 150
+	end
 	if not heightSpec and style.aspectRatio and style.aspectRatio > 0 then
 		local ratioHeight = borderBoxWidth / style.aspectRatio
 		heightSpec = style.boxSizing == "border-box" and ratioHeight or (ratioHeight - vertical)
@@ -6647,6 +7274,9 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	if #absolute > 0 then
 		layoutAbsolute(box, absolute, computedRef)
 	end
+	if #fixed > 0 then
+		layoutFixed(box, fixed, computedRef)
+	end
 
 	if style.overflow == "auto" or style.overflow == "scroll" then
 		box.scroll = true
@@ -6662,6 +7292,8 @@ end
 
 function Layout.build(document, computed, width, height)
 	computedRef = computed
+	viewportWidth = width
+	viewportHeight = height
 	local body = document.body
 	local style = computed[body.id]
 	local root = layoutElement(body, style, 0, 0, width, height, width, nil)
@@ -6817,6 +7449,84 @@ function Render.box(box, parentX, parentY, web)
 			height = height,
 			position = position,
 			style = { bg = style.background or false, radius = radius },
+		})
+	end
+
+	if node.tag == "canvas" then
+		local children = {}
+		for index, operation in node.__canvasOps or {} do
+			local color = Css.color(operation.color)
+			children[#children + 1] = Components.frame({
+				key = "cv" .. tostring(node.id) .. "-" .. tostring(index),
+				width = math.max(0, operation.width),
+				height = math.max(0, operation.height),
+				position = UDim2.fromOffset(operation.x, operation.y),
+				style = { bg = color or Color3.fromHex("#ffffff"), radius = 0 },
+			}, {})
+		end
+		return Components.frame({
+			key = "canvas" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			clip = true,
+			style = paint(style, width, height),
+		}, children)
+	end
+
+	if node.tag == "video" then
+		if attrs.poster and attrs.poster ~= "" then
+			return Components.image({
+				key = "v" .. node.id,
+				image = attrs.poster,
+				width = width,
+				height = height,
+				position = position,
+				style = { bg = style.background or false, radius = radius },
+			})
+		end
+		return Components.button({
+			key = "v" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			text = attrs.title or "video",
+			style = {
+				bg = style.background or Color3.fromHex("#121218"),
+				bgAlpha = 1 - ((style.backgroundAlpha or 1) * (style.opacity or 1)),
+				fg = style.color,
+				fontSize = math.max(1, math.floor(style.fontSize)),
+				font = fontToken(style),
+				radius = radius,
+				border = borderFor(style),
+				pad = { 8, 0 },
+			},
+			onClick = function()
+				web:playAudio(node)
+			end,
+		})
+	end
+
+	if node.tag == "audio" then
+		return Components.button({
+			key = "a" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			text = attrs.controls ~= nil and "Play audio" or "audio",
+			style = {
+				bg = style.background or Color3.fromHex("#121218"),
+				bgAlpha = 1 - ((style.backgroundAlpha or 1) * (style.opacity or 1)),
+				fg = style.color,
+				fontSize = math.max(1, math.floor(style.fontSize)),
+				font = fontToken(style),
+				radius = radius,
+				border = borderFor(style),
+				pad = { 8, 0 },
+			},
+			onClick = function()
+				web:playAudio(node)
+			end,
 		})
 	end
 
@@ -7129,6 +7839,9 @@ local KEYWORDS = {
 	["static"] = true,
 	["do"] = true,
 	["delete"] = true,
+	["async"] = true,
+	["await"] = true,
+	["yield"] = true,
 }
 
 -- Longest first.
@@ -7190,6 +7903,19 @@ local function isArray(value)
 	return metatable == ARRAY_MT or (type(metatable) == "table" and metatable.__jsarray == true)
 end
 
+local function regexAllowed(previous)
+	if not previous then
+		return true
+	end
+	if previous.type == "punc" then
+		return previous.value ~= ")" and previous.value ~= "]" and previous.value ~= "}"
+	elseif previous.type == "keyword" then
+		local value = previous.value
+		return value ~= "true" and value ~= "false" and value ~= "null" and value ~= "undefined" and value ~= "this"
+	end
+	return false
+end
+
 local function tokenize(source)
 	local tokens = {}
 	local index = 1
@@ -7229,6 +7955,45 @@ local function tokenize(source)
 				line += 1
 			end
 			index = close and (close + 2) or (length + 1)
+		elseif ch == "/" and regexAllowed(tokens[#tokens]) then
+			local startLine = line
+			local cursor = index + 1
+			local buffer = {}
+			local inClass = false
+			while cursor <= length do
+				local current = source:sub(cursor, cursor)
+				if current == "\\" then
+					buffer[#buffer + 1] = source:sub(cursor, cursor + 1)
+					cursor += 2
+				elseif current == "[" then
+					inClass = true
+					buffer[#buffer + 1] = current
+					cursor += 1
+				elseif current == "]" then
+					inClass = false
+					buffer[#buffer + 1] = current
+					cursor += 1
+				elseif current == "/" and not inClass then
+					break
+				elseif current == "\n" then
+					break
+				else
+					buffer[#buffer + 1] = current
+					cursor += 1
+				end
+			end
+			local flags = {}
+			cursor += 1
+			while cursor <= length and source:sub(cursor, cursor):match("[%a]") do
+				flags[#flags + 1] = source:sub(cursor, cursor)
+				cursor += 1
+			end
+			tokens[#tokens + 1] = {
+				type = "regex",
+				value = { source = table.concat(buffer), flags = table.concat(flags) },
+				line = startLine,
+			}
+			index = cursor
 		elseif ch == "'" or ch == '"' then
 			local quote = ch
 			local buffer = {}
@@ -7587,7 +8352,9 @@ function Parser:objectLiteral()
 		if self:match("punc", "...") then
 			fields[#fields + 1] = { spread = true, value = self:expression(1) }
 		else
-			local field = {}
+			local async = self:match("keyword", "async") ~= nil
+			local generator = self:match("punc", "*") ~= nil
+			local field = { async = async, generator = generator }
 			if self:at("punc", "[") then
 				self:next()
 				field.key = self:expression(0)
@@ -7627,7 +8394,9 @@ function Parser:classRest(name)
 			-- empty member
 		else
 			local static = self:match("keyword", "static") ~= nil
-			local member = { static = static }
+			local async = self:match("keyword", "async") ~= nil
+			local generator = self:match("punc", "*") ~= nil
+			local member = { static = static, async = async, generator = generator }
 			if self:at("punc", "[") then
 				self:next()
 				member.key = self:expression(0)
@@ -7667,6 +8436,9 @@ function Parser:primary()
 	if token.type == "number" or token.type == "string" then
 		self:next()
 		return { kind = "literal", value = token.value }
+	elseif token.type == "regex" then
+		self:next()
+		return { kind = "regex", source = token.value.source, flags = token.value.flags }
 	elseif token.type == "template" then
 		self:next()
 		return { kind = "template", parts = self:templateParts(token.value) }
@@ -7681,7 +8453,41 @@ function Parser:primary()
 			return { kind = "new", ctor = target, args = {} }
 		end
 		self:next()
-		if value == "true" then
+		if value == "async" then
+			if self:at("keyword", "function") then
+				self:next()
+				local generator = self:match("punc", "*") ~= nil
+				local name
+				if self:at("ident") then
+					name = self:next().value
+				end
+				local params, body = self:functionRest()
+				return { kind = "function", name = name, params = params, body = body, async = true, generator = generator }
+			elseif self:at("ident") and self:peek(1).type == "punc" and self:peek(1).value == "=>" then
+				local name = self:next().value
+				self:next()
+				return {
+					kind = "arrow",
+					params = { { pattern = { kind = "identPattern", name = name } } },
+					body = self:arrowBody(),
+					async = true,
+				}
+			else
+				local arrow = self:tryArrow()
+				if arrow then
+					arrow.async = true
+					return arrow
+				end
+				self:errorAt(token, "expected function or arrow after async")
+			end
+		elseif value == "await" then
+			return { kind = "await", value = self:unary() }
+		elseif value == "yield" then
+			local nextToken = self:peek()
+			local stops = nextToken.type == "eof"
+				or (nextToken.type == "punc" and (nextToken.value == ";" or nextToken.value == "}" or nextToken.value == ")" or nextToken.value == "]" or nextToken.value == "," or nextToken.value == ":"))
+			return { kind = "yield", value = stops and nil or self:expression(0) }
+		elseif value == "true" then
 			return { kind = "literal", value = true }
 		elseif value == "false" then
 			return { kind = "literal", value = false }
@@ -7708,12 +8514,13 @@ function Parser:primary()
 			end
 			return { kind = "super" }
 		elseif value == "function" then
+			local generator = self:match("punc", "*") ~= nil
 			local name
 			if self:at("ident") then
 				name = self:next().value
 			end
 			local params, body = self:functionRest()
-			return { kind = "function", name = name, params = params, body = body }
+			return { kind = "function", name = name, params = params, body = body, generator = generator }
 		elseif value == "class" then
 			local name
 			if self:at("ident") then
@@ -7795,7 +8602,11 @@ function Parser:postfix()
 		local token = self:peek()
 		if token.type == "punc" and token.value == "." then
 			self:next()
-			local name = self:expect("ident").value
+			local propertyToken = self:peek()
+			if propertyToken.type ~= "ident" and propertyToken.type ~= "keyword" then
+				self:errorAt(propertyToken, "expected property name")
+			end
+			local name = self:next().value
 			node = { kind = "member", object = node, property = { kind = "literal", value = name } }
 		elseif token.type == "punc" and token.value == "?." then
 			self:next()
@@ -7807,7 +8618,11 @@ function Parser:postfix()
 				self:expect("punc", "]")
 				node = { kind = "member", object = node, property = property, optional = true }
 			else
-				local name = self:expect("ident").value
+				local propertyToken = self:peek()
+				if propertyToken.type ~= "ident" and propertyToken.type ~= "keyword" then
+					self:errorAt(propertyToken, "expected property name")
+				end
+				local name = self:next().value
 				node = { kind = "member", object = node, property = { kind = "literal", value = name }, optional = true }
 			end
 		elseif token.type == "punc" and token.value == "[" then
@@ -8035,11 +8850,19 @@ function Parser:statement()
 		local value = token.value
 		if value == "let" or value == "const" or value == "var" then
 			return self:varDeclaration()
-		elseif value == "function" then
+		elseif value == "async" then
 			self:next()
+			self:expect("keyword", "function")
+			local generator = self:match("punc", "*") ~= nil
 			local name = self:expect("ident").value
 			local params, body = self:functionRest()
-			return { kind = "function", name = name, params = params, body = body }
+			return { kind = "function", name = name, params = params, body = body, async = true, generator = generator }
+		elseif value == "function" then
+			self:next()
+			local generator = self:match("punc", "*") ~= nil
+			local name = self:expect("ident").value
+			local params, body = self:functionRest()
+			return { kind = "function", name = name, params = params, body = body, generator = generator }
 		elseif value == "class" then
 			self:next()
 			local name = self:expect("ident").value
@@ -8275,6 +9098,466 @@ local function spreadArgs(nodes, env, context)
 		end
 	end
 	return args
+end
+
+-- Regular expressions ----------------------------------------------------
+
+local regexCompile
+local regexFindAll
+
+do
+	local function copyCaptures(captures)
+		local out = {}
+		for index, value in captures do
+			out[index] = value
+		end
+		return out
+	end
+
+	local function classHas(items, char, ignoreCase)
+		for _, item in items do
+			local matched = false
+			if item.kind == "char" then
+				matched = ignoreCase and char:lower() == item.char:lower() or char == item.char
+			elseif item.kind == "range" then
+				local current = ignoreCase and char:lower() or char
+				local from = ignoreCase and item.from:lower() or item.from
+				local to = ignoreCase and item.to:lower() or item.to
+				matched = current >= from and current <= to
+			elseif item.kind == "d" then
+				matched = char:match("%d") ~= nil
+			elseif item.kind == "w" then
+				matched = char:match("[%w_]") ~= nil
+			elseif item.kind == "s" then
+				matched = char:match("%s") ~= nil
+			end
+			if item.negate then
+				matched = not matched
+			end
+			if matched then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function classMatches(class, char, ignoreCase)
+		local matched = classHas(class.items, char, ignoreCase)
+		if class.negated then
+			return not matched
+		end
+		return matched
+	end
+
+	local function parsePattern(source)
+		local index = 1
+		local length = #source
+		local captures = 0
+
+		local function peek()
+			return source:sub(index, index)
+		end
+
+		local function take()
+			local char = source:sub(index, index)
+			index += 1
+			return char
+		end
+
+		local parseAlternation, parseSequence, parseAtom, parseClass
+
+		parseClass = function()
+			local negated = false
+			if peek() == "^" then
+				take()
+				negated = true
+			end
+			local items = {}
+			while index <= length and peek() ~= "]" do
+				local char = take()
+				if char == "\\" then
+					local escaped = take()
+					if escaped == "d" or escaped == "w" or escaped == "s" then
+						items[#items + 1] = { kind = escaped }
+					elseif escaped == "D" or escaped == "W" or escaped == "S" then
+						items[#items + 1] = { kind = escaped:lower(), negate = true }
+					elseif escaped == "n" then
+						items[#items + 1] = { kind = "char", char = "\n" }
+					else
+						items[#items + 1] = { kind = "char", char = escaped }
+					end
+				elseif peek() == "-" and source:sub(index + 1, index + 1) ~= "]" and source:sub(index + 1, index + 1) ~= "" then
+					take()
+					items[#items + 1] = { kind = "range", from = char, to = take() }
+				else
+					items[#items + 1] = { kind = "char", char = char }
+				end
+			end
+			if peek() == "]" then
+				take()
+			end
+			return { type = "class", negated = negated, items = items }
+		end
+
+		parseAtom = function()
+			local char = peek()
+			if char == "(" then
+				take()
+				local capture = true
+				if peek() == "?" and source:sub(index + 1, index + 1) == ":" then
+					index += 2
+					capture = false
+				end
+				local body = parseAlternation()
+				if peek() == ")" then
+					take()
+				end
+				local group = { type = "group", body = body, capture = capture }
+				if capture then
+					captures += 1
+					group.index = captures
+				end
+				return group
+			elseif char == "[" then
+				take()
+				return parseClass()
+			elseif char == "." then
+				take()
+				return { type = "any" }
+			elseif char == "^" then
+				take()
+				return { type = "assert", kind = "start" }
+			elseif char == "$" then
+				take()
+				return { type = "assert", kind = "end" }
+			elseif char == "\\" then
+				take()
+				local escaped = take()
+				if escaped == "d" or escaped == "w" or escaped == "s" then
+					return { type = "class", items = { { kind = escaped } } }
+				elseif escaped == "D" or escaped == "W" or escaped == "S" then
+					return { type = "class", items = { { kind = escaped:lower(), negate = true } } }
+				elseif escaped == "b" then
+					return { type = "assert", kind = "word" }
+				elseif escaped == "B" then
+					return { type = "assert", kind = "notword" }
+				elseif escaped == "n" then
+					return { type = "char", char = "\n" }
+				elseif escaped == "t" then
+					return { type = "char", char = "\t" }
+				elseif escaped == "r" then
+					return { type = "char", char = "\r" }
+				end
+				return { type = "char", char = escaped }
+			else
+				take()
+				return { type = "char", char = char }
+			end
+		end
+
+		local function parseTerm()
+			local atom = parseAtom()
+			local quantifier
+			local nextChar = peek()
+			if nextChar == "*" then
+				take()
+				quantifier = { min = 0 }
+			elseif nextChar == "+" then
+				take()
+				quantifier = { min = 1 }
+			elseif nextChar == "?" then
+				take()
+				quantifier = { min = 0, max = 1 }
+			elseif nextChar == "{" then
+				local close = source:find("}", index, true)
+				local body = close and source:sub(index + 1, close - 1) or ""
+				local minimum, maximum = body:match("^(%d+)%,(%d*)$")
+				if not minimum then
+					minimum = body:match("^(%d+)$")
+					maximum = minimum
+				end
+				if minimum then
+					index = (close or index) + 1
+					quantifier = {
+						min = tonumber(minimum),
+						max = maximum and maximum ~= "" and tonumber(maximum) or nil,
+					}
+				end
+			end
+			if quantifier then
+				if peek() == "?" then
+					take()
+					quantifier.greedy = false
+				end
+				return { atom = atom, quant = quantifier }
+			end
+			return { atom = atom }
+		end
+
+		parseSequence = function()
+			local terms = {}
+			while index <= length do
+				local char = peek()
+				if char == "|" or char == ")" then
+					break
+				end
+				terms[#terms + 1] = parseTerm()
+			end
+			return { terms = terms }
+		end
+
+		parseAlternation = function()
+			local options = { parseSequence() }
+			while peek() == "|" do
+				take()
+				options[#options + 1] = parseSequence()
+			end
+			return { options = options }
+		end
+
+		return parseAlternation()
+	end
+
+	local matchAlt, matchSeq
+
+	local function matchAtom(atom, input, position, captures, regex)
+		if atom.type == "char" then
+			local char = input:sub(position + 1, position + 1)
+			if char == "" then
+				return nil
+			end
+			if regex.ignoreCase then
+				if char:lower() ~= atom.char:lower() then
+					return nil
+				end
+			elseif char ~= atom.char then
+				return nil
+			end
+			return position + 1, captures
+		elseif atom.type == "any" then
+			local char = input:sub(position + 1, position + 1)
+			if char == "" or (char == "\n" and not regex.dotAll) then
+				return nil
+			end
+			return position + 1, captures
+		elseif atom.type == "class" then
+			local char = input:sub(position + 1, position + 1)
+			if char == "" then
+				return nil
+			end
+			if classMatches(atom, char, regex.ignoreCase) then
+				return position + 1, captures
+			end
+			return nil
+		elseif atom.type == "group" then
+			local endPosition, newCaptures = matchAlt(atom.body, input, position, copyCaptures(captures), regex)
+			if not endPosition then
+				return nil
+			end
+			if atom.index then
+				newCaptures = copyCaptures(newCaptures)
+				newCaptures[atom.index] = input:sub(position + 1, endPosition)
+			end
+			return endPosition, newCaptures
+		elseif atom.type == "assert" then
+			if atom.kind == "start" then
+				return position == 0 and position or nil, captures
+			elseif atom.kind == "end" then
+				return position == #input and position or nil, captures
+			elseif atom.kind == "word" or atom.kind == "notword" then
+				local before = input:sub(position, position):match("[%w_]") ~= nil
+				local after = input:sub(position + 1, position + 1):match("[%w_]") ~= nil
+				local boundary = before ~= after
+				if atom.kind == "word" then
+					return boundary and position or nil, captures
+				end
+				return (not boundary) and position or nil, captures
+			end
+		end
+		return nil
+	end
+
+	matchSeq = function(sequence, input, position, captures, regex)
+		local terms = sequence.terms
+		local function step(termIndex, current, caps)
+			if termIndex > #terms then
+				return current, caps
+			end
+			local term = terms[termIndex]
+			if term.quant then
+				local minimum = term.quant.min or 0
+				local maximum = term.quant.max
+				local positions = { [0] = current }
+				local capturesAt = { [0] = caps }
+				local count = 0
+				local scanPosition, scanCaptures = current, caps
+				while maximum == nil or count < maximum do
+					local nextPosition, nextCaptures = matchAtom(term.atom, input, scanPosition, scanCaptures, regex)
+					if not nextPosition or nextPosition == scanPosition then
+						break
+					end
+					count += 1
+					positions[count] = nextPosition
+					capturesAt[count] = nextCaptures
+					scanPosition, scanCaptures = nextPosition, nextCaptures
+				end
+				local order = {}
+				if term.quant.greedy ~= false then
+					for candidate = count, minimum, -1 do
+						order[#order + 1] = candidate
+					end
+				else
+					for candidate = minimum, count do
+						order[#order + 1] = candidate
+					end
+				end
+				for _, candidate in order do
+					local endPosition, endCaptures = step(termIndex + 1, positions[candidate], capturesAt[candidate])
+					if endPosition then
+						return endPosition, endCaptures
+					end
+				end
+				return nil
+			end
+			local nextPosition, nextCaptures = matchAtom(term.atom, input, current, caps, regex)
+			if not nextPosition then
+				return nil
+			end
+			return step(termIndex + 1, nextPosition, nextCaptures)
+		end
+		return step(1, position, captures)
+	end
+
+	matchAlt = function(alternation, input, position, captures, regex)
+		for _, option in alternation.options do
+			local endPosition, endCaptures = matchSeq(option, input, position, copyCaptures(captures), regex)
+			if endPosition then
+				return endPosition, endCaptures
+			end
+		end
+		return nil
+	end
+
+	regexFindAll = function(regex, input)
+		local results = {}
+		local position = 0
+		while position <= #input do
+			local endPosition, captures = matchAlt(regex.program, input, position, {}, regex)
+			if endPosition then
+				results[#results + 1] = {
+					index = position,
+					text = input:sub(position + 1, endPosition),
+					captures = captures,
+				}
+				position = endPosition > position and endPosition or position + 1
+			else
+				position += 1
+			end
+		end
+		return results
+	end
+
+	regexCompile = function(source, flags)
+		flags = flags or ""
+		local regex = {
+			__jsRegex = true,
+			source = source,
+			flags = flags,
+			program = parsePattern(source),
+			global = flags:find("g") ~= nil,
+			ignoreCase = flags:find("i") ~= nil,
+			multiline = flags:find("m") ~= nil,
+			dotAll = flags:find("s") ~= nil,
+			lastIndex = 0,
+		}
+		regex.test = function(input)
+			return regexFindAll(regex, tostring(input))[1] ~= nil
+		end
+		regex.exec = function(input)
+			input = tostring(input)
+			local start = regex.global and regex.lastIndex or 0
+			if start > #input then
+				regex.lastIndex = 0
+				return nil
+			end
+			local matches = regexFindAll(regex, input)
+			for _, match in matches do
+				if match.index >= start then
+					if regex.global then
+						regex.lastIndex = match.index + math.max(1, #match.text)
+					end
+					local out = Js.array({})
+					out[1] = match.text
+					out.index = match.index
+					for index, capture in match.captures or {} do
+						out[index + 1] = capture
+					end
+					return out
+				end
+			end
+			if regex.global then
+				regex.lastIndex = 0
+			end
+			return nil
+		end
+		return regex
+	end
+
+	Js.regex = regexCompile
+end
+
+local function regexResultArray(result)
+	if not result then
+		return nil
+	end
+	local out = Js.array({})
+	out[1] = result.text
+	out.index = result.index
+	for index, capture in result.captures or {} do
+		out[index + 1] = capture
+	end
+	return out
+end
+
+local function regexReplaceValue(regex, input, replacement, forceAll)
+	local matches = regexFindAll(regex, input)
+	if not (forceAll or regex.global) and #matches > 1 then
+		matches = { matches[1] }
+	end
+	if #matches == 0 then
+		return input
+	end
+	local parts = {}
+	local last = 0
+	for _, match in matches do
+		parts[#parts + 1] = input:sub(last + 1, match.index)
+		local replacementText
+		if type(replacement) == "function" then
+			local args = { n = 1 + #(match.captures or {}) }
+			args[1] = match.text
+			for index, capture in match.captures or {} do
+				args[index + 1] = capture
+			end
+			replacementText = toJsString(callFunction(replacement, args))
+		else
+			replacementText = tostring(replacement):gsub("%$([%$&%d]+)", function(token)
+				if token == "$" then
+					return "$"
+				elseif token == "&" then
+					return match.text
+				end
+				local index = tonumber(token)
+				if index == 0 then
+					return match.text
+				end
+				return (match.captures or {})[index] or ""
+			end)
+		end
+		parts[#parts + 1] = replacementText
+		last = match.index + #match.text
+	end
+	parts[#parts + 1] = input:sub(last + 1)
+	return table.concat(parts)
 end
 
 local function arrayMember(array, key)
@@ -8583,11 +9866,56 @@ local function stringMember(value, key)
 			end
 			return value:sub(first + 1, math.min(last, length))
 		end
+	elseif key == "match" then
+		return function(pattern)
+			if type(pattern) == "table" and pattern.__jsRegex then
+				local matches = regexFindAll(pattern, value)
+				if pattern.global then
+					local out = Js.array({})
+					for _, item in matches do
+						out[#out + 1] = item.text
+					end
+					return out
+				end
+				return regexResultArray(matches[1])
+			end
+			local found = value:find(tostring(pattern), 1, true)
+			return found and value:sub(found) or nil
+		end
+	elseif key == "matchAll" then
+		return function(pattern)
+			local out = Js.array({})
+			if type(pattern) == "table" and pattern.__jsRegex then
+				for _, item in regexFindAll(pattern, value) do
+					out[#out + 1] = regexResultArray(item)
+				end
+			end
+			return out
+		end
+	elseif key == "search" then
+		return function(pattern)
+			if type(pattern) == "table" and pattern.__jsRegex then
+				local match = regexFindAll(pattern, value)[1]
+				return match and match.index or -1
+			end
+			local found = value:find(tostring(pattern), 1, true)
+			return found and (found - 1) or -1
+		end
 	elseif key == "split" then
 		return function(separator)
 			local out = Js.array({})
 			if separator == nil then
 				out[1] = value
+				return out
+			end
+			if type(separator) == "table" and separator.__jsRegex then
+				local matches = regexFindAll(separator, value)
+				local last = 0
+				for _, match in matches do
+					out[#out + 1] = value:sub(last + 1, match.index)
+					last = match.index + #match.text
+				end
+				out[#out + 1] = value:sub(last + 1)
 				return out
 			end
 			separator = tostring(separator)
@@ -8611,6 +9939,9 @@ local function stringMember(value, key)
 		end
 	elseif key == "replace" or key == "replaceAll" then
 		return function(needle, replacement)
+			if type(needle) == "table" and needle.__jsRegex then
+				return regexReplaceValue(needle, value, replacement, key == "replaceAll")
+			end
 			needle = tostring(needle)
 			local count = key == "replace" and 1 or nil
 			local function substitute(found)
@@ -8903,47 +10234,289 @@ local function bindParams(params, args, env, context)
 	end
 end
 
+-- Promises and async scheduling -------------------------------------------
+
+local schedulePromise = function(fn)
+	if task and task.defer then
+		task.defer(fn)
+	elseif task and task.spawn then
+		task.spawn(fn)
+	else
+		fn()
+	end
+end
+
+local newPromise
+local settlePromise
+
+newPromise = function()
+	local promise = { __jsPromise = true, state = "pending", value = nil, handlers = {} }
+	promise["then"] = function(onFulfilled, onRejected)
+		local nextPromise = newPromise()
+		local source = promise
+		local function run()
+			local handler = source.state == "fulfilled" and onFulfilled or onRejected
+			if type(handler) ~= "function" then
+				settlePromise(nextPromise, source.state, source.value)
+				return
+			end
+			local ok, result = pcall(handler, source.value)
+			if not ok then
+				settlePromise(nextPromise, "rejected", result)
+				return
+			end
+			if type(result) == "table" and result.__jsPromise then
+				result["then"](function(value)
+					settlePromise(nextPromise, "fulfilled", value)
+				end, function(err)
+					settlePromise(nextPromise, "rejected", err)
+				end)
+			else
+				settlePromise(nextPromise, "fulfilled", result)
+			end
+		end
+		if source.state == "pending" then
+			source.handlers[#source.handlers + 1] = run
+		else
+			schedulePromise(run)
+		end
+		return nextPromise
+	end
+	promise.catch = function(onRejected)
+		return promise["then"](nil, onRejected)
+	end
+	promise.finally = function(callback)
+		return promise["then"](function(value)
+			if type(callback) == "function" then
+				callback()
+			end
+			return value
+		end, function(err)
+			if type(callback) == "function" then
+				callback()
+			end
+			error(err, 0)
+		end)
+	end
+	return promise
+end
+
+settlePromise = function(promise, state, value)
+	if promise.state ~= "pending" then
+		return
+	end
+	promise.state = state
+	promise.value = value
+	local handlers = promise.handlers
+	promise.handlers = {}
+	for _, handler in handlers do
+		schedulePromise(handler)
+	end
+end
+
+Js.promise = function(executor)
+	local promise = newPromise()
+	if type(executor) == "function" then
+		local ok, err = pcall(executor, function(value)
+			settlePromise(promise, "fulfilled", value)
+		end, function(reason)
+			settlePromise(promise, "rejected", reason)
+		end)
+		if not ok then
+			settlePromise(promise, "rejected", err)
+		end
+	end
+	return promise
+end
+
+Js.promiseResolve = function(value)
+	if type(value) == "table" and value.__jsPromise then
+		return value
+	end
+	local promise = newPromise()
+	settlePromise(promise, "fulfilled", value)
+	return promise
+end
+
+Js.promiseReject = function(reason)
+	local promise = newPromise()
+	settlePromise(promise, "rejected", reason)
+	return promise
+end
+
+Js.promiseAll = function(list)
+	local promise = newPromise()
+	local total = 0
+	if type(list) == "table" then
+		total = #list
+	end
+	if total == 0 then
+		settlePromise(promise, "fulfilled", Js.array({}))
+		return promise
+	end
+	local results = Js.array({})
+	local remaining = total
+	for index = 1, total do
+		Js.promiseResolve(list[index])["then"](function(value)
+			results[index] = value
+			remaining -= 1
+			if remaining == 0 then
+				settlePromise(promise, "fulfilled", results)
+			end
+		end, function(err)
+			settlePromise(promise, "rejected", err)
+		end)
+	end
+	return promise
+end
+
+Js.promiseRace = function(list)
+	local promise = newPromise()
+	if type(list) == "table" then
+		for index = 1, #list do
+			Js.promiseResolve(list[index])["then"](function(value)
+				settlePromise(promise, "fulfilled", value)
+			end, function(err)
+				settlePromise(promise, "rejected", err)
+			end)
+		end
+	end
+	return promise
+end
+
 makeFunction = function(node, closure, context)
 	local isArrow = node.kind == "arrow"
 	local lexicalThis = context.currentThis
 	local fn
 	local info = { isArrow = isArrow }
-	fn = function(...)
-		local args = table.pack(...)
-		local thisValue
-		if args.n >= 2 and args[args.n - 1] == THIS then
-			thisValue = args[args.n]
-			args[args.n] = nil
-			args[args.n - 1] = nil
-			args.n -= 2
+
+	local function createEnvironment(args)
+		local callEnv = Env.new(closure)
+		callEnv:declare("arguments", args)
+		if node.name then
+			callEnv:declare(node.name, fn)
 		end
-		local savedThis = context.currentThis
-		context.currentThis = isArrow and lexicalThis or thisValue
-		local ok, result = pcall(function()
-			local callEnv = Env.new(closure)
-			callEnv:declare("arguments", args)
-			if node.name then
-				callEnv:declare(node.name, fn)
+		bindParams(node.params, args, callEnv, context)
+		return callEnv
+	end
+
+	local function runBody(callEnv)
+		context.steps += 1
+		if context.steps > MAX_STEPS then
+			error("JS error: script exceeded the step limit", 0)
+		end
+		if node.body.kind == "block" then
+			local control = execBlock(node.body, callEnv, context)
+			if control and control.type == "return" then
+				return control.value
 			end
-			bindParams(node.params, args, callEnv, context)
-			context.steps += 1
-			if context.steps > MAX_STEPS then
-				error("JS error: script exceeded the step limit", 0)
+			return nil
+		end
+		return evalExpression(node.body.expression, callEnv, context)
+	end
+
+	if node.generator then
+		fn = function(...)
+			local args = table.pack(...)
+			local thisValue
+			if args.n >= 2 and args[args.n - 1] == THIS then
+				thisValue = args[args.n]
+				args[args.n] = nil
+				args[args.n - 1] = nil
+				args.n -= 2
 			end
-			if node.body.kind == "block" then
-				local control = execBlock(node.body, callEnv, context)
-				if control and control.type == "return" then
-					return control.value
+			local callEnv = createEnvironment(args)
+			local savedThis = context.currentThis
+			local thread = coroutine.create(function()
+				context.currentThis = isArrow and lexicalThis or thisValue
+				local result = runBody(callEnv)
+				context.currentThis = savedThis
+				return result
+			end)
+			local generator = { __jsGenerator = true, done = false, thread = thread }
+			generator.next = function(...)
+				if generator.done then
+					return { value = nil, done = true }
 				end
-				return nil
+				local ok, value = coroutine.resume(thread, ...)
+				if not ok then
+					generator.done = true
+					error(value, 0)
+				end
+				if coroutine.status(thread) == "dead" then
+					generator.done = true
+					return { value = value, done = true }
+				end
+				return { value = value, done = false }
 			end
-			return evalExpression(node.body.expression, callEnv, context)
-		end)
-		context.currentThis = savedThis
-		if not ok then
-			error(result, 0)
+			return generator
 		end
-		return result
+	elseif node.async then
+		fn = function(...)
+			local args = table.pack(...)
+			local thisValue
+			if args.n >= 2 and args[args.n - 1] == THIS then
+				thisValue = args[args.n]
+				args[args.n] = nil
+				args[args.n - 1] = nil
+				args.n -= 2
+			end
+			local callEnv = createEnvironment(args)
+			local promise = newPromise()
+			local savedThis = context.currentThis
+			local thread = coroutine.create(function()
+				context.currentThis = isArrow and lexicalThis or thisValue
+				local result = runBody(callEnv)
+				context.currentThis = savedThis
+				return result
+			end)
+			local function step(ok, value)
+				if not ok then
+					settlePromise(promise, "rejected", value)
+					return
+				end
+				if coroutine.status(thread) == "dead" then
+					settlePromise(promise, "fulfilled", value)
+					return
+				end
+				if type(value) == "table" and value.__await then
+					value.__await["then"](function(result)
+						schedulePromise(function()
+							step(coroutine.resume(thread, { __awaitValue = result }))
+						end)
+					end, function(err)
+						schedulePromise(function()
+							step(coroutine.resume(thread, { __awaitError = err }))
+						end)
+					end)
+				else
+					settlePromise(promise, "fulfilled", value)
+				end
+			end
+			step(coroutine.resume(thread))
+			return promise
+		end
+	else
+		fn = function(...)
+			local args = table.pack(...)
+			local thisValue
+			if args.n >= 2 and args[args.n - 1] == THIS then
+				thisValue = args[args.n]
+				args[args.n] = nil
+				args[args.n - 1] = nil
+				args.n -= 2
+			end
+			local savedThis = context.currentThis
+			context.currentThis = isArrow and lexicalThis or thisValue
+			local ok, result = pcall(function()
+				return runBody(createEnvironment(args))
+			end)
+			context.currentThis = savedThis
+			if not ok then
+				error(result, 0)
+			end
+			return result
+		end
 	end
 	functionInfo[fn] = info
 	return fn
@@ -8967,7 +10540,13 @@ evaluateClass = function(node, env, context)
 	for _, member in node.members do
 		local key = member.computed and evalExpression(member.key, classEnv, context) or member.key
 		if member.kind == "method" then
-			local fn = makeFunction({ kind = "function", params = member.params, body = member.body }, classEnv, context)
+			local fn = makeFunction({
+				kind = "function",
+				params = member.params,
+				body = member.body,
+				async = member.async,
+				generator = member.generator,
+			}, classEnv, context)
 			if member.constructor then
 				classObject.constructor = fn
 			elseif member.static then
@@ -8995,6 +10574,35 @@ evalExpression = function(node, env, context)
 	local kind = node.kind
 	if kind == "literal" then
 		return node.value
+	elseif kind == "regex" then
+		return regexCompile(node.source, node.flags)
+	elseif kind == "await" then
+		local value = evalExpression(node.value, env, context)
+		if type(value) == "table" and value.__jsPromise then
+			if value.state == "rejected" then
+				error(value.value, 0)
+			elseif value.state == "fulfilled" then
+				return value.value
+			end
+			if not coroutine.isyieldable() then
+				error("await on a pending promise outside an async function", 0)
+			end
+			local resumed = coroutine.yield({ __await = value })
+			if type(resumed) == "table" and resumed.__awaitError ~= nil then
+				error(resumed.__awaitError, 0)
+			end
+			return resumed and resumed.__awaitValue or nil
+		end
+		return value
+	elseif kind == "yield" then
+		if not coroutine.isyieldable() then
+			error("yield outside a generator", 0)
+		end
+		local yielded
+		if node.value then
+			yielded = evalExpression(node.value, env, context)
+		end
+		return coroutine.yield(yielded)
 	elseif kind == "identifier" then
 		return env:get(node.name)
 	elseif kind == "this" then
@@ -9043,7 +10651,13 @@ evalExpression = function(node, env, context)
 			else
 				local key = field.computed and evalExpression(field.key, env, context) or field.key
 				if field.method then
-					out[key] = makeFunction({ kind = "function", params = field.method.params, body = field.method.body }, env, context)
+					out[key] = makeFunction({
+						kind = "function",
+						params = field.method.params,
+						body = field.method.body,
+						async = field.async,
+						generator = field.generator,
+					}, env, context)
 				else
 					out[key] = evalExpression(field.value, env, context)
 				end
@@ -9301,6 +10915,25 @@ execStatement = function(node, env, context)
 		return nil
 	elseif kind == "forOf" then
 		local iterable = evalExpression(node.iterable, env, context)
+		if type(iterable) == "table" and iterable.__jsGenerator then
+			while true do
+				local step = iterable.next()
+				if step.done then
+					break
+				end
+				local iterationEnv = Env.new(env)
+				bindPattern(node.pattern, step.value, iterationEnv, context, true)
+				local control = execStatement(node.body, iterationEnv, context)
+				if control then
+					if control.type == "break" then
+						break
+					elseif control.type == "return" then
+						return control
+					end
+				end
+			end
+			return nil
+		end
 		local values = {}
 		if isArray(iterable) then
 			for index = 1, #iterable do
@@ -9434,6 +11067,8 @@ function Js.run(source, host)
 end
 
 Js.tokenize = tokenize
+Js.toJsString = toJsString
+Js.promiseNew = newPromise
 Js.isArray = isArray
 Js.truthy = truthy
 Js.typeOf = typeOf
@@ -9639,6 +11274,45 @@ function Bindings.create(web)
 					list[#list + 1] = wrap(item)
 				end
 				return list
+			end
+		elseif key == "getContext" then
+			return function(kind)
+				if tostring(kind):lower() ~= "2d" then
+					return nil
+				end
+				if node.__canvasContext then
+					return node.__canvasContext
+				end
+				local operations = {}
+				node.__canvasOps = operations
+				local context = { fillStyle = "#ffffff", strokeStyle = "#ffffff", lineWidth = 1 }
+				context.fillRect = function(x, y, width, height)
+					operations[#operations + 1] = {
+						x = tonumber(x) or 0,
+						y = tonumber(y) or 0,
+						width = tonumber(width) or 0,
+						height = tonumber(height) or 0,
+						color = tostring(context.fillStyle),
+					}
+					Dom.changed(node)
+				end
+				context.clearRect = function(x, y, width, height)
+					local left = tonumber(x) or 0
+					local top = tonumber(y) or 0
+					local right = left + (tonumber(width) or 0)
+					local bottom = top + (tonumber(height) or 0)
+					for index = #operations, 1, -1 do
+						local operation = operations[index]
+						local intersects = operation.x < right and operation.x + operation.width > left
+							and operation.y < bottom and operation.y + operation.height > top
+						if intersects then
+							table.remove(operations, index)
+						end
+					end
+					Dom.changed(node)
+				end
+				node.__canvasContext = context
+				return context
 			end
 		elseif key == "getAttribute" then
 			return function(name)
@@ -10071,11 +11745,38 @@ function Bindings.create(web)
 	local host = {
 		document = documentWrapper,
 		console = console,
+		RegExp = function(source, flags)
+			return Js.regex(tostring(source or ""), flags and tostring(flags) or "")
+		end,
+		Promise = {
+			__jsClass = true,
+			prototype = {},
+			constructor = function(executor)
+				return Js.promise(executor)
+			end,
+			resolve = function(value)
+				return Js.promiseResolve(value)
+			end,
+			reject = function(reason)
+				return Js.promiseReject(reason)
+			end,
+			all = function(list)
+				return Js.promiseAll(list)
+			end,
+			race = function(list)
+				return Js.promiseRace(list)
+			end,
+		},
 		Math = mathHost,
 		Object = objectHost,
 		Array = arrayHost,
 		Number = numberHost,
 		String = {
+			__jsClass = true,
+			prototype = {},
+			constructor = function(value)
+				return Js.toJsString(value)
+			end,
 			fromCharCode = function(...)
 				local parts = {}
 				for index = 1, select("#", ...) do

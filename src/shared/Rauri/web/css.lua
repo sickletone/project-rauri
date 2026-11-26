@@ -63,6 +63,9 @@ local TAG_DISPLAY = {
 	pre = "block",
 	blockquote = "block",
 	span = "inline",
+	canvas = "inline-block",
+	video = "inline-block",
+	audio = "inline-block",
 	a = "inline",
 	b = "inline",
 	strong = "inline",
@@ -475,18 +478,26 @@ local function parseCompound(text)
 				nextIndex = close + 1
 			end
 		elseif ch == ":" then
-			local name
-			name, nextIndex = text:match("^:([%w_%-]+)()", index)
-			if name then
-				local pseudo = { name = name:lower() }
-				if text:sub(nextIndex, nextIndex) == "(" then
-					local close = text:find(")", nextIndex, true)
-					if close then
-						pseudo.arg = text:sub(nextIndex + 1, close - 1)
-						nextIndex = close + 1
-					end
+			if text:sub(index + 1, index + 1) == ":" then
+				local name
+				name, nextIndex = text:match("^::([%w_%-]+)()", index)
+				if name then
+					compound.pseudoElement = name:lower()
 				end
-				compound.pseudos[#compound.pseudos + 1] = pseudo
+			else
+				local name
+				name, nextIndex = text:match("^:([%w_%-]+)()", index)
+				if name then
+					local pseudo = { name = name:lower() }
+					if text:sub(nextIndex, nextIndex) == "(" then
+						local close = text:find(")", nextIndex, true)
+						if close then
+							pseudo.arg = text:sub(nextIndex + 1, close - 1)
+							nextIndex = close + 1
+						end
+					end
+					compound.pseudos[#compound.pseudos + 1] = pseudo
+				end
 			end
 		else
 			local name
@@ -569,6 +580,9 @@ local function specificityOf(parts)
 		end
 		classes += #compound.classes + #compound.attrs + #compound.pseudos
 		if compound.tag and compound.tag ~= "*" then
+			tags += 1
+		end
+		if compound.pseudoElement then
 			tags += 1
 		end
 	end
@@ -803,6 +817,7 @@ function Css.parseSelector(text)
 			selectors[#selectors + 1] = {
 				parts = parts,
 				specificity = specificityOf(parts),
+				pseudoElement = parts[#parts].compound.pseudoElement,
 				text = chunk,
 			}
 		end
@@ -828,6 +843,7 @@ function Css.parse(source, options)
 	options = options or {}
 	local viewportWidth = options.width or 1e6
 	local rules = {}
+	local keyframes = {}
 	local order = 0
 	local text = tostring(source or ""):gsub("/%*.-%*/", "")
 
@@ -854,6 +870,36 @@ function Css.parse(source, options)
 		index = cursor
 
 		if selectorText:sub(1, 1) == "@" then
+			local keyframeName = selectorText:match("^@keyframes%s+([%w_%-]+)$")
+			if keyframeName then
+				local frames = {}
+				local frameIndex = 1
+				while frameIndex <= #body do
+					local frameOpen = body:find("{", frameIndex, true)
+					if not frameOpen then
+						break
+					end
+					local label = body:sub(frameIndex, frameOpen - 1):gsub("^%s+", ""):gsub("%s+$", "")
+					local frameClose = body:find("}", frameOpen, true) or #body
+					local percent = tonumber(label:match("([%d%.]+)"))
+					if label == "from" then
+						percent = 0
+					elseif label == "to" then
+						percent = 100
+					end
+					if percent then
+						frames[#frames + 1] = {
+							percent = percent,
+							declarations = parseDeclarations(body:sub(frameOpen + 1, frameClose - 1)),
+						}
+					end
+					frameIndex = frameClose + 1
+				end
+				table.sort(frames, function(a, b)
+					return a.percent < b.percent
+				end)
+				keyframes[keyframeName] = frames
+			else
 			local condition = selectorText:match("^@media%s*(.+)$")
 			if condition then
 				local applies = true
@@ -874,7 +920,11 @@ function Css.parse(source, options)
 						rule.order = order
 						rules[#rules + 1] = rule
 					end
+					for name, frames in nested.keyframes or {} do
+						keyframes[name] = frames
+					end
 				end
+			end
 			end
 		else
 			order += 1
@@ -885,7 +935,7 @@ function Css.parse(source, options)
 			}
 		end
 	end
-	return { rules = rules }
+	return { rules = rules, keyframes = keyframes }
 end
 
 -- Computed styles -------------------------------------------------------
@@ -914,6 +964,11 @@ local DEFAULT_STYLE = {
 	justifyItems = "stretch",
 	order = 0,
 	aspectRatio = nil,
+	float = "none",
+	content = nil,
+	transition = nil,
+	animation = nil,
+	animationName = nil,
 	whiteSpace = "normal",
 	textTransform = "none",
 	visibility = "visible",
@@ -1205,6 +1260,20 @@ local function applyDeclaration(style, declaration, context)
 		style.left = Css.length(value, fontSize, rootFontSize)
 	elseif prop == "cursor" then
 		style.cursor = value
+	elseif prop == "float" then
+		style.float = value
+	elseif prop == "content" then
+		style.content = value
+	elseif prop == "transition" then
+		style.transition = value
+	elseif prop == "animation" then
+		style.animation = value
+		local name = value:match("^%s*([%w_%-]+)")
+		if name and name ~= "none" then
+			style.animationName = name
+		end
+	elseif prop == "animation-name" then
+		style.animationName = value
 	end
 end
 
@@ -1226,7 +1295,7 @@ local function collectDeclarations(node, stylesheet, inlineCache)
 	for _, rule in stylesheet.rules do
 		local best = -1
 		for _, selector in rule.selectors do
-			if matchParts(node, selector.parts, #selector.parts, stylesheet.root) then
+			if not selector.pseudoElement and matchParts(node, selector.parts, #selector.parts, stylesheet.root) then
 				if selector.specificity > best then
 					best = selector.specificity
 				end
@@ -1267,6 +1336,51 @@ local function collectDeclarations(node, stylesheet, inlineCache)
 	return declarations
 end
 
+local function collectPseudoDeclarations(node, stylesheet, which)
+	local matched = {}
+	for _, rule in stylesheet.rules do
+		local best = -1
+		for _, selector in rule.selectors do
+			if selector.pseudoElement == which and matchParts(node, selector.parts, #selector.parts, stylesheet.root) then
+				if selector.specificity > best then
+					best = selector.specificity
+				end
+			end
+		end
+		if best >= 0 then
+			matched[#matched + 1] = { rule = rule, specificity = best, order = rule.order }
+		end
+	end
+	table.sort(matched, function(a, b)
+		if a.specificity == b.specificity then
+			return a.order < b.order
+		end
+		return a.specificity < b.specificity
+	end)
+	local declarations = {}
+	for _, entry in matched do
+		for _, declaration in entry.rule.declarations do
+			declarations[#declarations + 1] = declaration
+		end
+	end
+	return declarations
+end
+
+local function resolvePseudoContent(value, node)
+	if not value then
+		return nil
+	end
+	local quoted = value:match('^"(.*)"$') or value:match("^'(.*)'$")
+	if quoted then
+		return quoted
+	end
+	local attribute = value:match("^attr%s*%(%s*([%w_%-]+)%s*%)$")
+	if attribute then
+		return node.attrs[attribute:lower()] or ""
+	end
+	return nil
+end
+
 function Css.compute(document, stylesheet, options)
 	options = options or {}
 	local rootFontSize = options.rootFontSize or 16
@@ -1299,7 +1413,37 @@ function Css.compute(document, stylesheet, options)
 		for _, declaration in declarations do
 			applyDeclaration(style, declaration, context)
 		end
+		if options.animationTime and style.animationName and stylesheet.keyframes then
+			local duration = tostring(style.animation or ""):match("([%d%.]+)%s*(m?s)")
+			if duration then
+				duration = tonumber(duration) or 1
+				if style.animation:find("ms", 1, true) then
+					duration /= 1000
+				end
+			end
+			duration = math.max(0.001, duration or 1)
+			local progress = (options.animationTime / duration) % 1
+			local sampled = Css.sampleKeyframes(stylesheet, style.animationName, progress)
+			for prop, value in sampled or {} do
+				applyDeclaration(style, { prop = prop, value = value }, context)
+			end
+		end
 		computed[node.id] = style
+
+		for _, which in { "before", "after" } do
+			local pseudoDeclarations = collectPseudoDeclarations(node, stylesheet, which)
+			if #pseudoDeclarations > 0 then
+				local pseudoStyle = inheritedStyle(style)
+				pseudoStyle.display = "inline"
+				pseudoStyle.position = "static"
+				local pseudoContext = { vars = vars, parentStyle = style, rootFontSize = rootFontSize }
+				for _, declaration in pseudoDeclarations do
+					applyDeclaration(pseudoStyle, declaration, pseudoContext)
+				end
+				pseudoStyle.content = resolvePseudoContent(pseudoStyle.content, node)
+				computed[node.id .. "::" .. which] = pseudoStyle
+			end
+		end
 
 		for _, child in node.children do
 			if child.type == "element" then
@@ -1312,6 +1456,98 @@ function Css.compute(document, stylesheet, options)
 		walk(document.body, nil, {})
 	end
 	return computed
+end
+
+function Css.sampleKeyframes(stylesheet, name, progress)
+	local frames = stylesheet and stylesheet.keyframes and stylesheet.keyframes[name]
+	if not frames or #frames == 0 then
+		return nil
+	end
+	progress = clamp01(tonumber(progress) or 0) * 100
+	local before, after = frames[1], frames[#frames]
+	for _, frame in frames do
+		if frame.percent <= progress then
+			before = frame
+		end
+		if frame.percent >= progress then
+			after = frame
+			break
+		end
+	end
+	local span = after.percent - before.percent
+	local t = span > 0 and (progress - before.percent) / span or 1
+	local function frameValue(frame, prop)
+		for _, declaration in frame.declarations do
+			if declaration.prop == prop then
+				return declaration.value
+			end
+		end
+		return nil
+	end
+	local props = {}
+	for _, frame in { before, after } do
+		for _, declaration in frame.declarations do
+			props[declaration.prop] = true
+		end
+	end
+	local result = {}
+	for prop in props do
+		local a = frameValue(before, prop) or frameValue(after, prop)
+		local b = frameValue(after, prop) or a
+		if a and b then
+			local na, nb = tonumber(a), tonumber(b)
+			if na and nb then
+				result[prop] = tostring(na + (nb - na) * t)
+			else
+				local colorA = Css.color(a)
+				local colorB = Css.color(b)
+				if colorA and colorB then
+					local red = colorA.R + (colorB.R - colorA.R) * t
+					local green = colorA.G + (colorB.G - colorA.G) * t
+					local blue = colorA.B + (colorB.B - colorA.B) * t
+					result[prop] = string.format("#%02x%02x%02x", math.floor(red * 255 + 0.5), math.floor(green * 255 + 0.5), math.floor(blue * 255 + 0.5))
+				else
+					result[prop] = t < 0.5 and a or b
+				end
+			end
+		end
+	end
+	return result
+end
+
+-- transition: property duration[, ...] -- durations in seconds.
+function Css.parseTransition(value)
+	local spec = {}
+	for part in tostring(value or ""):gmatch("[^,]+") do
+		local prop = part:match("^%s*([%w%-]+)")
+		local amount, unit = part:match("([%d%.]+)%s*(m?s)")
+		if prop and prop:match("^[%d%.]+$") then
+			prop = "all"
+		end
+		if prop and amount then
+			local seconds = tonumber(amount) or 0
+			if unit == "ms" then
+				seconds /= 1000
+			end
+			spec[prop:lower()] = seconds
+		end
+	end
+	return spec
+end
+
+function Css.blendValue(from, to, progress)
+	progress = clamp01(progress)
+	if type(from) == "number" and type(to) == "number" then
+		return from + (to - from) * progress
+	end
+	if typeof(from) == "Color3" and typeof(to) == "Color3" then
+		return Color3.new(
+			from.R + (to.R - from.R) * progress,
+			from.G + (to.G - from.G) * progress,
+			from.B + (to.B - from.B) * progress
+		)
+	end
+	return progress < 0.5 and from or to
 end
 
 Css.DEFAULT_STYLE = DEFAULT_STYLE

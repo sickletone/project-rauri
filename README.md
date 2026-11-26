@@ -102,9 +102,9 @@ document.getElementById("go").addEventListener("click", () => {
 ```
 
 - `Rauri.web.app(config)` mounts a `ScreenGui` (gethui under an executor, PlayerGui otherwise) and returns `web`, `core`, `gui` and `window`.
-- Layout: block, flexbox (wrap, grow/shrink, align/order), CSS grid, inline flow, absolute positioning, `calc()`, media queries, margins/padding/borders/radius, gradients, CSS variables, `:not`/`:nth-child`/sibling selectors, hover/focus/checked states, text wrapping, scroll frames and Molto icons via `data-icon`.
+- Layout: block, flexbox (wrap, grow/shrink, align/order), CSS grid with spans, inline flow, absolute/fixed/sticky positioning, floats, `calc()`, media queries, margins/padding/borders/radius, gradients, CSS variables, `:not`/`:nth-child`/sibling/pseudo-element selectors, hover/focus/checked states, hover color/background/opacity transitions, text wrapping, scroll frames, canvas 2D rectangles, audio/video tags and Molto icons via `data-icon`.
 - HTML controls: text/checkbox/radio/range inputs, `<textarea>`, `<select>`, `<table>`, `<details>`, `<progress>`, `<br>`/`<hr>` and `<label for>`.
-- JavaScript: classes with `extends`/`super`, `this`/`new`, destructuring, spread/rest, optional chaining, `??`, `switch`, `try/catch`, loops, arrays/objects, template strings, DOM queries and events, `rauri.command/notify/theme/storage/on`, and `localStorage`.
+- JavaScript: classes with `extends`/`super`, `this`/`new`, destructuring, spread/rest, optional chaining, `??`, `switch`, `try/catch`, loops, regex literals and `RegExp`, `async`/`await` with promises, generators, arrays/objects, template strings, DOM queries and events, `rauri.command/notify/theme/storage/on`, and `localStorage`.
 - Customize everything: `chrome = false` for your own titlebar, `theme` variables, any HTML/CSS/JS, Luau DOM access (`Rauri.web.dom`), commands and capabilities, host hooks (`onLog`, `onInput`, `onClose`).
 
 The full supported subset and API are in [docs/WEB.md](docs/WEB.md); `examples/WebHub.lua` is a complete executor hub (run `examples/WebHubLoader.lua` to load it in one line).
@@ -234,7 +234,7 @@ node scripts/bundle.mjs --entry tests/example.luau --prepend tests/mock.luau \
   --out dist/example.luau && luau dist/example.luau
 ```
 
-`tests/mock.luau` implements the slice of the Roblox API Rauri touches (instances, signals, enums, UDim2, Color3, services, task). The demo test boots Rauri Studio, navigates every page, switches icon providers, searches, triggers a capability denial and exercises minimize/close/reopen. The web test covers the parser, cascade, layout, JS events, theme variables and ScreenGui mounting; `tests/js.luau` covers the language (classes, destructuring, optional chaining, switch, try/catch) and `tests/css.luau` covers flex-wrap, grid, `calc()`, selectors, media queries and the HTML controls; the example test drives the executor hub end to end.
+`tests/mock.luau` implements the slice of the Roblox API Rauri touches (instances, signals, enums, UDim2, Color3, services, task). The demo test boots Rauri Studio, navigates every page, switches icon providers, searches, triggers a capability denial and exercises minimize/close/reopen. The web test covers the parser, cascade, layout, JS events, theme variables and ScreenGui mounting; `tests/js.luau` covers the language (classes, destructuring, optional chaining, switch, try/catch, regex, async/promises, generators, canvas) and `tests/css.luau` covers flex-wrap, grid spans, `calc()`, selectors, pseudo-elements, floats, fixed/sticky, keyframes and the HTML controls; the example test drives the executor hub end to end.
 
 ## Demo
 

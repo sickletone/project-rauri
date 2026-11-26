@@ -142,6 +142,10 @@ Unknown tags are block elements by default.
 - `<details>`/`<summary>` collapse their body until the summary is clicked.
 - `<progress value max>` renders a bar, `<br>` forces a line break and `<hr>` a divider.
 - `<label for="id">` focuses or clicks its target.
+- `<canvas width height>` is a 2D surface: `getContext("2d")` supports
+  `fillStyle` with `fillRect`/`clearRect`, rendered as frame rectangles.
+- `<video poster src>` shows its poster (or a placeholder tile); `<audio src controls>`
+  renders a play button that sends `src` to a Roblox `Sound`.
 
 Attributes that drive behaviour:
 
@@ -159,21 +163,24 @@ Selectors: `*`, `tag`, `.class`, `#id`, `[attr]`, `[attr=value]` (`*=`, `^=`,
 `$=`, `~=`, `|=`, `!=`), `:hover`, `:active`, `:focus`, `:focus-within`,
 `:checked`, `:disabled`, `:enabled`, `:empty`, `:root`, `:first-child`,
 `:last-child`, `:only-child`, `:nth-child(an+b)`, `:nth-last-child()`,
-`:not(selector)`, `:is()`/`:where()`, descendant, `>`, `+` and `~` combinators,
-comma groups. Cascade is by specificity then source order, with inline styles
+`:not(selector)`, `:is()`/`:where()`, `::before`/`::after` pseudo-elements,
+descendant, `>`, `+` and `~` combinators, comma groups. Cascade is by specificity then source order, with inline styles
 last. `@media (min-width|max-width: Npx) { ... }` is evaluated against the
 window width when the stylesheet is built.
 
 Layout properties:
 
 - `display`: `block`, `flex`, `grid`, `inline`, `inline-block`, `none`
-- `position`: `static`, `absolute` (with `top`/`right`/`bottom`/`left`/`inset`)
+- `position`: `static`, `absolute` (with `top`/`right`/`bottom`/`left`/`inset`),
+  `fixed` (viewport-anchored) and `sticky` (applies its `top`/`left` at layout time)
 - flexbox: `flex-direction` (row/column), `justify-content` (`start`, `center`,
   `end`, `space-between`, `space-around`), `align-items`/`align-self`/
   `align-content` (`start`, `center`, `end`, `stretch`), `flex`/`flex-grow`/
   `flex-shrink`/`flex-basis`, `flex-wrap: wrap`, `order`, `gap`
 - grid: `grid-template-columns`/`grid-template-rows` (`px`, `%`, `fr`, `auto`),
-  row-major auto-placement, `gap`
+  row-major auto-placement, `gap`, `grid-column`/`grid-row` spans
+- `float: left|right` (boxes sit at the content edge; following block content
+  flows below them)
 - `width`, `height`, `min-*`, `max-*`, `aspect-ratio`, `margin`, `padding`,
   `box-sizing`
 - `border` (width style color), `border-*`, `border-radius` (px or `%`)
@@ -188,8 +195,14 @@ Paint and text:
 - CSS variables: `--name`, `var(--name, fallback)`
 
 Units: `px`, `%`, `em`, `rem`, `vw`/`vh` and `calc()` (`+ - * /`, parentheses).
-No transitions, animations, `@keyframes`, `::before`/`::after`, `@supports`,
-`@import`, `float` or `position: sticky/fixed`.
+`::before`/`::after` render their `content` (quoted string or `attr(...)`) as
+inline text that inherits from the element. `@keyframes` are parsed; `animation:
+name duration` loops through sampled keyframes while the page repaints, and
+`web:animate(node, "name", seconds)` drives one manually. `transition:
+color|background|opacity <duration>` animates those properties when hover state
+changes (linear interpolation, driven from the existing box snapshot); other
+transitioned properties are stored but not tweened. `@supports` and `@import`
+are ignored.
 
 Because layout is computed to pixels and rendered on Roblox, text alignment and
 wrapping come from `TextService:GetTextSize`; weights map to Gotham faces and
@@ -219,6 +232,13 @@ An ES2019-ish interpreter, not a full engine. It supports:
 - `Math`, `Object.keys/values/entries/assign`, `JSON.parse/stringify` (through
   `HttpService` when available), `parseInt`, `parseFloat`, `isNaN`,
   `setTimeout`, `clearTimeout`, `console`, `localStorage`
+- regex literals (`/\d+/gi`) and `new RegExp(source, flags)`: `test`, `exec`,
+  `source`, `flags`, `lastIndex`; string `match`, `matchAll`, `search`, regex
+  `split`, and `replace`/`replaceAll` with `$1`, `$&` and `$$`
+- `async function`, async arrows and `await`, backed by promises (`new Promise`,
+  `then`/`catch`/`finally`, `Promise.resolve/reject/all/race`) scheduled with
+  `task.defer`
+- generators: `function*`, `yield`, `.next()` and `for...of` over generator objects
 - array methods: `push`, `pop`, `shift`, `unshift`, `join`, `forEach`, `map`,
   `filter`, `find`, `findIndex`, `some`, `every`, `reduce`, `slice`, `splice`,
   `concat`, `reverse`, `sort`, `flat`, `at`, `indexOf`, `includes`; string
@@ -227,9 +247,9 @@ An ES2019-ish interpreter, not a full engine. It supports:
   `charCodeAt`, `indexOf`, `repeat`, `padStart`, `padEnd`, `concat`,
   `toUpperCase`, `toLowerCase`
 
-Not supported: regex literals, `async`/`await`/promises, generators, getters and
-setters, tagged templates, labels, `with`, BigInt. Script errors go to `onLog`
-(or `warn`).
+Not supported: getters/setters, tagged templates, labels, `with`, BigInt,
+`yield*`, async generators, lookaround/named-group/backreference regex syntax.
+Script errors go to `onLog` (or `warn`).
 
 ### DOM
 
@@ -244,7 +264,8 @@ Elements expose `tagName`, `id`, `className`, `textContent`/`innerText`,
 `nextSibling`, `appendChild`, `append`, `removeChild`, `remove`,
 `addEventListener`/`removeEventListener`, `onclick`/`oninput`/`onchange`/
 `onsubmit`, `closest`, `matches`, `click`, `focus`, `blur`,
-`getBoundingClientRect`, `clientWidth`/`clientHeight`, `offsetLeft`/`offsetTop`.
+`getBoundingClientRect`, `clientWidth`/`clientHeight`, `offsetLeft`/`offsetTop`,
+and `getContext("2d")` on `<canvas>` (`fillStyle`, `fillRect`, `clearRect`).
 
 Events bubble up the tree: `click`, `input`, `change` (checkbox), `submit`.
 The event object has `type`, `target`, `currentTarget`, `value`, `key`,
@@ -348,12 +369,19 @@ node scripts/bundle.mjs --entry examples/WebHub.lua \
 
 ## Limits
 
-- This is a UI engine, not a browser: no network stack, media playback,
-  canvas, iframes, form submission, navigation or real `<a href>`.
-- Layout is single-pass: no `float`, no sticky/fixed positioning, grid spans are
-  ignored, and there is no text shaping beyond Roblox's.
-- No CSS transitions/animations, pseudo-elements, `@supports` or `@import`.
-- The JS engine covers the listed syntax; regex literals and async code are the
-  main gaps.
+- This is a UI engine, not a browser: no network stack, iframes, form
+  submission, navigation or real `<a href>`.
+- Canvas records 2D rectangles (`fillStyle`, `fillRect`, `clearRect`) only: no
+  paths, text, images or pixel reads. Video shows a poster/placeholder; audio
+  playback depends on `SoundService` and the executor allowing `Sound`.
+- Layout is single-pass: floats do not wrap text around them, sticky offsets do
+  not react to scrolling, fixed boxes are still children of their scroll
+  container, and there is no text shaping beyond Roblox's.
+- CSS transitions animate `color`, `background` (including alpha) and `opacity`
+  on hover with linear timing; other properties are parsed but not interpolated.
+  Keyframe animations loop on repaint (or via `web:animate`), pseudo-elements
+  are inline text only, and there is no `@supports`/`@import`.
+- The JS engine covers the listed syntax; regex lookaround/backreferences,
+  getters/setters and modules remain gaps.
 - Executor APIs differ between vendors; the platform layer degrades gracefully
   and never requires them.

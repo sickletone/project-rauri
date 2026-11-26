@@ -25,7 +25,7 @@ local Platform = require(script.Parent.platform)
 local Web = {}
 Web.__index = Web
 
-Web.version = "0.2.0"
+Web.version = "0.3.1"
 
 local BASE_CSS = [[
 * { box-sizing: border-box; }
@@ -167,6 +167,30 @@ local DEFAULT_VARS = {
 	["--radius"] = "12px",
 }
 
+local function transitionFields(prop)
+	if prop == "all" then
+		return { "color", "background", "opacity" }
+	elseif prop == "color" or prop == "opacity" then
+		return { prop }
+	elseif prop == "background" or prop == "background-color" then
+		return { "background", "backgroundAlpha" }
+	end
+	return {}
+end
+
+local transitionCache = {}
+local function transitionSpec(value)
+	if not value then
+		return nil
+	end
+	local cached = transitionCache[value]
+	if not cached then
+		cached = Css.parseTransition(value)
+		transitionCache[value] = cached
+	end
+	return cached
+end
+
 local function chromeMarkup(title, body)
 	return string.format([[
 <div class="rauri-window">
@@ -204,6 +228,10 @@ function Web.new(config)
 	self.toastCounter = 0
 	self.closed = false
 	self.vars = {}
+	self.transitions = {}
+	self.pendingTransitions = {}
+	self.animationLoopRunning = false
+	self.animationInUse = false
 
 	for name, value in DEFAULT_VARS do
 		self.vars[name] = value
@@ -290,6 +318,8 @@ function Web:rebuildStyles()
 	local css = BASE_CSS .. "\n" .. self:themeCss() .. "\n" .. self.styleTags .. "\n" .. (self.config.css or "")
 	self.stylesheet = Css.parse(css, { width = self.width })
 	self.hoverable = css:find(":hover", 1, true) ~= nil
+	self.hasAnimations = css:find("@keyframes", 1, true) ~= nil
+		and (css:find("animation%s*:") ~= nil or css:find("animation%-name%s*:") ~= nil)
 end
 
 function Web:invalidate()
@@ -359,6 +389,171 @@ function Web:start()
 			self:log(err)
 		end
 	end
+
+	if self.hasAnimations and self.config.animations ~= false then
+		self.animationStart = os.clock()
+		self.animationTime = 0
+		self.animationInUse = true
+		self:ensureAnimationLoop()
+	end
+end
+
+function Web:ensureAnimationLoop()
+	if self.animationLoopRunning or self.closed then
+		return
+	end
+	if self.config.animations == false and next(self.transitions) == nil then
+		return
+	end
+	self.animationLoopRunning = true
+	-- Defer so starting a transition during a view never re-enters that view.
+	task.defer(function()
+		while not self.closed do
+			local hasTransitions = next(self.transitions) ~= nil
+			local hasAnimation = self.animationInUse and self.config.animations ~= false
+			if not hasTransitions and not hasAnimation then
+				break
+			end
+			if hasAnimation and self.animationStart then
+				self.animationTime = os.clock() - self.animationStart
+			end
+			self:invalidate()
+			task.wait(1 / 30)
+		end
+		self.animationLoopRunning = false
+	end)
+end
+
+function Web:captureTransition(node)
+	if self.config.transitions == false then
+		return
+	end
+	local box = self:boxOf(node)
+	local style = box and box.style
+	if not style then
+		return
+	end
+	self.pendingTransitions[node.id] = {
+		color = style.color,
+		background = style.background,
+		backgroundAlpha = style.backgroundAlpha,
+		opacity = style.opacity,
+	}
+end
+
+function Web:startPendingTransitions(computed)
+	if next(self.pendingTransitions) == nil then
+		return
+	end
+	local now = os.clock()
+	local started = false
+	for nodeId, snapshot in self.pendingTransitions do
+		local style = computed[nodeId]
+		local spec = style and transitionSpec(style.transition)
+		if spec and next(spec) then
+			local durations = {}
+			for prop, seconds in spec do
+				for _, field in transitionFields(prop) do
+					if durations[field] == nil or prop ~= "all" then
+						durations[field] = seconds
+					end
+				end
+			end
+			local entries = self.transitions[nodeId] or {}
+			for field, seconds in durations do
+				local from = snapshot[field]
+				local target = style[field]
+				if seconds > 0 and from ~= nil and target ~= nil and from ~= target then
+					entries[field] = { from = from, start = now, duration = seconds }
+				end
+			end
+			if next(entries) then
+				self.transitions[nodeId] = entries
+				started = true
+			end
+		end
+	end
+	self.pendingTransitions = {}
+	if started then
+		self:ensureAnimationLoop()
+	end
+end
+
+function Web:applyTransitions(computed)
+	if next(self.transitions) == nil then
+		return
+	end
+	local now = os.clock()
+	for nodeId, entries in self.transitions do
+		local style = computed[nodeId]
+		if not style then
+			self.transitions[nodeId] = nil
+		else
+			local remaining = false
+			for field, entry in entries do
+				local progress = (now - entry.start) / entry.duration
+				if progress >= 1 then
+					entries[field] = nil
+				else
+					remaining = true
+					local target = style[field]
+					if target ~= nil then
+						style[field] = Css.blendValue(entry.from, target, progress)
+					end
+				end
+			end
+			if not remaining then
+				self.transitions[nodeId] = nil
+			end
+		end
+	end
+end
+
+function Web:animate(node, name, duration, options)
+	options = options or {}
+	if not node or not self.stylesheet then
+		return
+	end
+	duration = math.max(0.001, tonumber(duration) or 0.3)
+	local steps = math.max(1, tonumber(options.steps) or 20)
+	local iterations = tonumber(options.iterations) or (options.loop and math.huge or 1)
+	task.spawn(function()
+		for _ = 1, iterations do
+			for step = 0, steps do
+				if self.closed then
+					return
+				end
+				local values = Css.sampleKeyframes(self.stylesheet, name, step / steps)
+				for prop, value in values or {} do
+					Dom.setStyle(node, prop, value)
+				end
+				self:invalidate()
+				task.wait(duration / steps)
+			end
+		end
+	end)
+end
+
+function Web:playAudio(node)
+	local source = node and node.attrs and node.attrs.src
+	if not source or source == "" then
+		return
+	end
+	local ok = pcall(function()
+		local sound = Instance.new("Sound")
+		sound.SoundId = source
+		sound.Volume = 0.5
+		sound.Parent = game:GetService("SoundService")
+		sound:Play()
+		task.delay(30, function()
+			if sound then
+				sound:Destroy()
+			end
+		end)
+	end)
+	if not ok then
+		self:log("audio: could not play " .. tostring(source))
+	end
 end
 
 function Web:notify(message, duration)
@@ -383,6 +578,7 @@ function Web:setHover(node, hovered)
 	if node.state.hover == hovered then
 		return
 	end
+	self:captureTransition(node)
 	node.state.hover = hovered
 	self:invalidate()
 end
@@ -619,7 +815,18 @@ function Web:view()
 	end
 
 	self.boxById = {}
-	local computed = Css.compute(self.document, self.stylesheet, {})
+	local computed = Css.compute(self.document, self.stylesheet, { animationTime = self.animationTime })
+	self:startPendingTransitions(computed)
+	self:applyTransitions(computed)
+	if self.hasAnimations then
+		self.animationInUse = false
+		for _, style in computed do
+			if style.animationName then
+				self.animationInUse = true
+				break
+			end
+		end
+	end
 	local root = Layout.build(self.document, computed, self.width, self.height)
 	self:indexBoxes(root)
 

@@ -143,6 +143,84 @@ function Render.box(box, parentX, parentY, web)
 		})
 	end
 
+	if node.tag == "canvas" then
+		local children = {}
+		for index, operation in node.__canvasOps or {} do
+			local color = Css.color(operation.color)
+			children[#children + 1] = Components.frame({
+				key = "cv" .. tostring(node.id) .. "-" .. tostring(index),
+				width = math.max(0, operation.width),
+				height = math.max(0, operation.height),
+				position = UDim2.fromOffset(operation.x, operation.y),
+				style = { bg = color or Color3.fromHex("#ffffff"), radius = 0 },
+			}, {})
+		end
+		return Components.frame({
+			key = "canvas" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			clip = true,
+			style = paint(style, width, height),
+		}, children)
+	end
+
+	if node.tag == "video" then
+		if attrs.poster and attrs.poster ~= "" then
+			return Components.image({
+				key = "v" .. node.id,
+				image = attrs.poster,
+				width = width,
+				height = height,
+				position = position,
+				style = { bg = style.background or false, radius = radius },
+			})
+		end
+		return Components.button({
+			key = "v" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			text = attrs.title or "video",
+			style = {
+				bg = style.background or Color3.fromHex("#121218"),
+				bgAlpha = 1 - ((style.backgroundAlpha or 1) * (style.opacity or 1)),
+				fg = style.color,
+				fontSize = math.max(1, math.floor(style.fontSize)),
+				font = fontToken(style),
+				radius = radius,
+				border = borderFor(style),
+				pad = { 8, 0 },
+			},
+			onClick = function()
+				web:playAudio(node)
+			end,
+		})
+	end
+
+	if node.tag == "audio" then
+		return Components.button({
+			key = "a" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			text = attrs.controls ~= nil and "Play audio" or "audio",
+			style = {
+				bg = style.background or Color3.fromHex("#121218"),
+				bgAlpha = 1 - ((style.backgroundAlpha or 1) * (style.opacity or 1)),
+				fg = style.color,
+				fontSize = math.max(1, math.floor(style.fontSize)),
+				font = fontToken(style),
+				radius = radius,
+				border = borderFor(style),
+				pad = { 8, 0 },
+			},
+			onClick = function()
+				web:playAudio(node)
+			end,
+		})
+	end
+
 	if node.tag == "select" then
 		local options = {}
 		for _, child in ipairs(node.children) do
