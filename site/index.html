@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Rauri renders HTML, CSS and a small JavaScript runtime as Roblox UI. It runs in Studio and in script executors.">
+  <title>Rauri - HTML and CSS interfaces for Roblox</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="shell header-inner">
+      <a class="brand" href="#top" aria-label="Rauri home">
+        <span class="mark" aria-hidden="true"></span>
+        <span>Rauri</span>
+      </a>
+      <nav class="site-nav" aria-label="Main">
+        <a href="#overview">Overview</a>
+        <a href="#builder">Builder</a>
+        <a href="#start">Quick start</a>
+        <a class="nav-github" href="https://github.com/sickletone/project-rauri">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero shell" id="overview">
+      <div class="hero-copy">
+        <p class="eyebrow">Roblox UI toolkit</p>
+        <h1>Interfaces written like a web page, rendered as Roblox UI.</h1>
+        <p class="lede">Rauri parses HTML, applies a CSS cascade and box layout, and runs a small JavaScript runtime against a DOM. The result is drawn with Roblox instances in Studio and in script executors.</p>
+        <div class="actions">
+          <a class="button primary" href="#builder">Open the builder</a>
+          <a class="button" href="https://github.com/sickletone/project-rauri">View source</a>
+        </div>
+        <dl class="facts">
+          <div><dt>Build</dt><dd>One Lua file</dd></div>
+          <div><dt>Layout</dt><dd>Flex, grid, inline flow</dd></div>
+          <div><dt>Devices</dt><dd>Desktop and touch</dd></div>
+        </dl>
+      </div>
+
+      <div class="hero-panel">
+        <div class="panel-bar">
+          <span>Executor loader</span>
+          <button class="copy-button" data-copy-target="loader-code" type="button">Copy</button>
+        </div>
+        <pre class="code" id="loader-code"><code>loadstring(game:HttpGet(
+  "https://raw.githubusercontent.com/sickletone/project-rauri/main/examples/WebHubLoader.lua"
+))()</code></pre>
+        <p class="panel-note">Loads the published build and the example hub. On phones the window fills the screen and uses touch-sized controls.</p>
+      </div>
+    </section>
+
+    <section class="features" aria-label="What Rauri provides">
+      <div class="shell features-grid">
+        <article>
+          <h2>HTML and CSS</h2>
+          <p>A parser, cascade and layout engine for the parts interfaces use: flex, grid, inline flow, media queries, absolute and fixed positioning, pseudo-elements and hover transitions.</p>
+        </article>
+        <article>
+          <h2>A small JavaScript runtime</h2>
+          <p>Classes, promises, generators, regular expressions and a DOM with events. Enough for panels, tabs and local state without embedding a browser.</p>
+        </article>
+        <article>
+          <h2>Studio and executors</h2>
+          <p>The published build is a single Lua chunk. It finds a GUI parent, protects the ScreenGui when an executor allows it, and keeps working when those APIs are absent.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="builder-section" id="builder">
+      <div class="shell">
+        <div class="section-head">
+          <p class="eyebrow">Builder</p>
+          <h2>Place elements on the grid. Export the markup.</h2>
+          <p class="section-copy">The canvas snaps to a 10px grid. Select a layer to change its size, colors and text. Export produces HTML and CSS for Rauri web, plus a Lua wrapper that mounts the window.</p>
+        </div>
+
+        <div class="editor" aria-label="Interface builder">
+          <aside class="panel palette">
+            <div class="panel-heading">
+              <span>Elements</span>
+            </div>
+            <div class="add-grid">
+              <button type="button" data-add="frame"><span class="glyph glyph-frame" aria-hidden="true"></span><span>Frame</span></button>
+              <button type="button" data-add="text"><span class="glyph glyph-text" aria-hidden="true">T</span><span>Text</span></button>
+              <button type="button" data-add="button"><span class="glyph glyph-button" aria-hidden="true"></span><span>Button</span></button>
+              <button type="button" data-add="input"><span class="glyph glyph-input" aria-hidden="true"></span><span>Input</span></button>
+              <button type="button" data-add="image"><span class="glyph glyph-image" aria-hidden="true"></span><span>Image</span></button>
+            </div>
+
+            <div class="panel-heading layers-heading">
+              <span>Layers</span>
+              <span class="count" id="layer-count">0</span>
+            </div>
+            <ul class="layers" id="layers"></ul>
+          </aside>
+
+          <div class="stage-column">
+            <div class="stage-bar">
+              <input id="project-title" class="project-title" value="Untitled window" aria-label="Window title" spellcheck="false">
+              <div class="stage-actions">
+                <button type="button" id="undo" class="small" disabled>Undo</button>
+                <button type="button" id="redo" class="small" disabled>Redo</button>
+                <button type="button" id="clear" class="small quiet">Clear</button>
+                <button type="button" id="export" class="small solid">Export</button>
+              </div>
+            </div>
+
+            <div class="stage" id="stage">
+              <div class="artboard" id="artboard">
+                <svg class="canvas-grid" viewBox="0 0 720 420" preserveAspectRatio="none" aria-hidden="true">
+                  <defs>
+                    <pattern id="grid-pattern" width="20" height="20" patternUnits="userSpaceOnUse">
+                      <path d="M 20 0 L 0 0 0 20" fill="none" stroke="currentColor" stroke-width="1"></path>
+                    </pattern>
+                  </defs>
+                  <rect width="720" height="420" fill="url(#grid-pattern)"></rect>
+                </svg>
+                <div class="elements" id="elements"></div>
+              </div>
+            </div>
+
+            <div class="stage-foot">
+              <span>Drag to move. The corner handle resizes.</span>
+              <span>720 &times; 420</span>
+            </div>
+          </div>
+
+          <aside class="panel inspector">
+            <div class="panel-heading">
+              <span>Inspector</span>
+              <button type="button" id="delete" class="small quiet" disabled>Delete</button>
+            </div>
+            <p class="empty" id="inspector-empty">Select an element to edit it.</p>
+            <div class="fields hidden" id="inspector-fields"></div>
+          </aside>
+        </div>
+      </div>
+    </section>
+
+    <section class="start shell" id="start">
+      <div class="start-copy">
+        <p class="eyebrow">Quick start</p>
+        <h2>Three steps to a window.</h2>
+        <ol class="steps">
+          <li>
+            <span class="step-number">01</span>
+            <div>
+              <h3>Load the build</h3>
+              <p>Fetch <code>dist/rauri.lua</code> with the loader, or bundle the repository into a single file for a game.</p>
+            </div>
+          </li>
+          <li>
+            <span class="step-number">02</span>
+            <div>
+              <h3>Write the interface</h3>
+              <p>Pass HTML, CSS and JavaScript strings to <code>Rauri.web.app</code>. The builder exports the same shape.</p>
+            </div>
+          </li>
+          <li>
+            <span class="step-number">03</span>
+            <div>
+              <h3>Run it</h3>
+              <p>The window mounts into a ScreenGui. On touch devices it takes the full viewport and rebuilds when the screen changes.</p>
+            </div>
+          </li>
+        </ol>
+        <a class="text-link" href="https://github.com/sickletone/project-rauri/blob/main/docs/WEB.md">Read the web reference</a>
+      </div>
+
+      <div class="start-code">
+        <div class="panel-bar">
+          <span>Minimal app</span>
+          <button class="copy-button" data-copy-target="start-code" type="button">Copy</button>
+        </div>
+        <pre class="code" id="start-code"><code>local Rauri = loadstring(game:HttpGet(
+  "https://raw.githubusercontent.com/sickletone/project-rauri/main/dist/rauri.lua"
+))()
+
+Rauri.web.app({
+  title = "Panel",
+  width = 420,
+  height = 300,
+  html = [[
+    &lt;h1&gt;Session&lt;/h1&gt;
+    &lt;button id="run"&gt;Run script&lt;/button&gt;
+  ]],
+  css = [[
+    body { padding: 18px; background: #0b0b0f; color: #f2f2f6; }
+    h1 { font-size: 20px; margin: 0 0 12px 0; }
+    button { background: #f2f2f6; color: #101014; }
+  ]],
+  js = [[
+    document.getElementById("run").addEventListener("click", () =&gt; {
+      rauri.notify("Running");
+    });
+  ]],
+})</code></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="shell footer-inner">
+      <div class="footer-brand">
+        <span class="mark" aria-hidden="true"></span>
+        <span>Rauri</span>
+      </div>
+      <p>HTML and CSS interfaces for Roblox. Built as a Lua library with no third-party runtime dependencies.</p>
+      <nav aria-label="Footer">
+        <a href="#builder">Builder</a>
+        <a href="https://github.com/sickletone/project-rauri">GitHub</a>
+        <a href="https://github.com/sickletone/project-rauri/blob/main/docs/WEB.md">Docs</a>
+      </nav>
+    </div>
+  </footer>
+
+  <dialog id="export-dialog" class="export-dialog" aria-labelledby="export-title">
+    <div class="dialog-head">
+      <h3 id="export-title">Export</h3>
+      <button type="button" id="close-export" class="small quiet">Close</button>
+    </div>
+    <div class="tabs" role="tablist" aria-label="Export format">
+      <button type="button" role="tab" data-tab="html" aria-selected="true">HTML</button>
+      <button type="button" role="tab" data-tab="css" aria-selected="false">CSS</button>
+      <button type="button" role="tab" data-tab="lua" aria-selected="false">Lua</button>
+    </div>
+    <pre class="export-code"><code id="export-code"></code></pre>
+    <div class="dialog-foot">
+      <span id="export-note">HTML for Rauri web.</span>
+      <div class="dialog-actions">
+        <button type="button" id="copy-export" class="small">Copy</button>
+        <button type="button" id="download-export" class="small solid">Download</button>
+      </div>
+    </div>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="site.js"></script>
+</body>
+</html>

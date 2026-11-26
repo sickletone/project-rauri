@@ -178,10 +178,42 @@ check(
 )
 check(Rauri.platform.isExecutor() == false, "studio detection in the mock")
 check(Rauri.platform.guiParent() ~= nil, "platform finds a GUI parent")
+
+local inputService = game:GetService("UserInputService")
+inputService.TouchEnabled = true
+inputService.KeyboardEnabled = false
+check(Rauri.platform.isMobile() == true, "touch devices report mobile")
+inputService.KeyboardEnabled = true
+check(Rauri.platform.isMobile() == false, "devices with keyboards keep the desktop window")
+inputService.TouchEnabled = nil
+inputService.KeyboardEnabled = nil
 check(app.web:var("border") ~= "", "default theme variables exist")
 
 app:close()
 check(#Mock.warnings == 0, "no warnings during web tests: " .. table.concat(Mock.warnings, " | "))
+
+-- Mobile window ---------------------------------------------------------
+
+local mobile = Rauri.web.new({
+	mobile = true,
+	viewport = { width = 390, height = 844 },
+	chrome = false,
+	html = [[<div id="mobile-card"></div>]],
+	css = [[
+#mobile-card { width: 100%; height: 40px; background: #000000; }
+@media (max-width: 600px) { #mobile-card { height: 60px; } }
+]],
+})
+mobile:start()
+mobile:view()
+local mobileCard = mobile:boxOf(Dom.query(mobile.document, "#mobile-card"))
+check(mobile.mobile == true and mobile.fullscreen == true, "mobile mode is available through config")
+check(mobile.width == 390 and mobile.height == 844 and mobile.radius == 0, "mobile window fills the viewport")
+check(mobileCard ~= nil and math.abs(mobileCard.height - 60) < 1, "mobile media queries apply at the viewport width")
+mobile:resize(844, 390)
+mobile:view()
+check(mobile.width == 844 and mobile.height == 390, "resize updates the window and layout")
+mobile:close()
 
 print(string.format("%d passed, %d failed", passed, failed))
 if failed > 0 then

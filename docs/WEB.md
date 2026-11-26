@@ -109,7 +109,10 @@ with `core:mount(function() return web:view() end)`.
 | `css` | — | extra CSS, appended after the default theme |
 | `js` | — | source string or array of sources |
 | `title` | `"Rauri"` | titlebar text / ScreenGui name |
-| `width`, `height` | `760`, `520` | window size in pixels |
+| `width`, `height` | `760`, `520` | window size in pixels; clamped to the camera viewport |
+| `mobile` | auto | touch-device mode; detected from `UserInputService` |
+| `mobileFullscreen` | `true` | on touch devices, fill the whole camera viewport with square corners |
+| `viewport` | camera size | override the viewport (useful for tests and embedded previews) |
 | `chrome` | `true` | wrap HTML in the default titlebar/body |
 | `theme` | — | CSS variable overrides (`accent`, `bg`, `radius`, ...) |
 | `radius` | `12` | root corner radius |
@@ -123,6 +126,13 @@ HTML `<script>` tags run after `config.js` unless they have a `src`; in an
 executor, `src` URLs are fetched with `game:HttpGet`, as are `<link
 rel="stylesheet">` files. `<style>` tags are added to the stylesheet.
 Elsewhere remote scripts and styles are ignored.
+
+On phones and tablets the window defaults to the full camera viewport, drops its
+corner radius, and rebuilds when the viewport changes (rotation, split screen).
+The small-screen rules in the base stylesheet use a 34px titlebar, 10px body
+padding and 34px minimum button height. Set `mobile = false` to keep the desktop
+window, or `mobileFullscreen = false` to center a fixed-size window instead.
+`Web:resize(width, height)` updates the window at runtime.
 
 ## HTML
 
@@ -334,6 +344,8 @@ Useful `Web` members: `document`, `version`, `toasts`, `minimized`, `position`, 
 
 ```lua
 Rauri.platform.isExecutor()  --> boolean (gethui / clipboard / file globals present)
+Rauri.platform.isMobile()    --> boolean (touch screen without a keyboard)
+Rauri.platform.viewportSize() --> width, height from the current camera
 Rauri.platform.summary()     --> { executor, clipboard, fileIO, http }
 Rauri.platform.guiParent()   --> gethui() in executors, PlayerGui otherwise
 Rauri.platform.protect(gui)  --> protect_gui when available

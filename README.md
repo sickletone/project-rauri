@@ -42,6 +42,7 @@ src/shared/Rauri/        the framework (Rojo: ReplicatedStorage.Rauri)
 src/client/              Rauri Studio, the demo app (StarterPlayerScripts)
 docs/WEB.md              HTML/CSS/JS frontend + executor guide
 examples/WebHub.lua      a complete executor hub in HTML/CSS/JS
+site/                    landing page and interface builder (static)
 scripts/bundle.mjs       single-file bundler + test harness loader
 tests/                   headless test suite (mock Roblox API)
 default.project.json     Rojo mapping
@@ -105,9 +106,18 @@ document.getElementById("go").addEventListener("click", () => {
 - Layout: block, flexbox (wrap, grow/shrink, align/order), CSS grid with spans, inline flow, absolute/fixed/sticky positioning, floats, `calc()`, media queries, margins/padding/borders/radius, gradients, CSS variables, `:not`/`:nth-child`/sibling/pseudo-element selectors, hover/focus/checked states, hover color/background/opacity transitions, text wrapping, scroll frames, canvas 2D rectangles, audio/video tags and Molto icons via `data-icon`.
 - HTML controls: text/checkbox/radio/range inputs, `<textarea>`, `<select>`, `<table>`, `<details>`, `<progress>`, `<br>`/`<hr>` and `<label for>`.
 - JavaScript: classes with `extends`/`super`, `this`/`new`, destructuring, spread/rest, optional chaining, `??`, `switch`, `try/catch`, loops, regex literals and `RegExp`, `async`/`await` with promises, generators, arrays/objects, template strings, DOM queries and events, `rauri.command/notify/theme/storage/on`, and `localStorage`.
+- Mobile: touch devices open the window full-screen by default, with a flat black surface, a 34px titlebar, larger controls and a layout that rebuilds on viewport changes. Set `mobile = false` to keep the desktop window or `mobileFullscreen = false` for a centered one.
 - Customize everything: `chrome = false` for your own titlebar, `theme` variables, any HTML/CSS/JS, Luau DOM access (`Rauri.web.dom`), commands and capabilities, host hooks (`onLog`, `onInput`, `onClose`).
 
 The full supported subset and API are in [docs/WEB.md](docs/WEB.md); `examples/WebHub.lua` is a complete executor hub (run `examples/WebHubLoader.lua` to load it in one line).
+
+### Builder site
+
+`site/` is a static landing page with a visual interface builder. Drag frames, text, buttons, inputs and images on a 720x420 grid, edit position, size, colors and text, then export the HTML and CSS with a Lua wrapper. It has no build step and no dependencies; open `site/index.html` or serve the folder:
+
+```bash
+cd site && python3 -m http.server 4173
+```
 
 ### Executors
 

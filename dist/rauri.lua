@@ -2873,6 +2873,33 @@ function Platform.isExecutor()
 	return globalFunction("gethui") or globalFunction("setclipboard") or globalFunction("readfile")
 end
 
+-- Touch phones and tablets without a hardware keyboard. Executors inherit the
+-- device values, so the same check works in Studio and in games.
+function Platform.isMobile()
+	local ok, input = pcall(function()
+		return game:GetService("UserInputService")
+	end)
+	if not ok or not input then
+		return false
+	end
+	return input.TouchEnabled == true and input.KeyboardEnabled ~= true
+end
+
+-- Camera viewport in pixels, with a desktop fallback for headless runs.
+function Platform.viewportSize()
+	local ok, camera = pcall(function()
+		local workspaceService = game:GetService("Workspace")
+		return workspaceService and workspaceService.CurrentCamera
+	end)
+	if ok and camera then
+		local size = camera.ViewportSize
+		if size and size.X and size.Y and size.X > 0 and size.Y > 0 then
+			return size.X, size.Y
+		end
+	end
+	return 1280, 720
+end
+
 -- The safest container for a Rauri UI: gethui when available (executors keep
 -- it above the game and outside detection), PlayerGui otherwise so Studio and
 -- headless tests keep working.
@@ -3020,7 +3047,7 @@ local Platform = __require("src/shared/Rauri/platform")
 local Web = {}
 Web.__index = Web
 
-Web.version = "0.3.1"
+Web.version = "0.4.0"
 
 local BASE_CSS = [[
 * { box-sizing: border-box; }
@@ -3145,6 +3172,13 @@ input::placeholder { color: var(--muted); }
   color: var(--muted);
   font-size: 13px;
 }
+@media (max-width: 600px) {
+  .rauri-titlebar { height: 34px; padding: 0 10px; }
+  .rauri-body { padding: 10px; }
+  button, input, select, textarea { font-size: 14px; }
+  button { min-height: 34px; }
+  h1 { font-size: 20px; }
+}
 ]]
 
 local DEFAULT_VARS = {
@@ -3211,11 +3245,28 @@ function Web.new(config)
 	config = config or {}
 	local self = setmetatable({}, Web)
 	self.config = config
-	self.width = config.width or 760
-	self.height = config.height or 520
-	self.radius = config.radius or 12
+
+	local viewportWidth, viewportHeight = Platform.viewportSize()
+	if config.viewport then
+		viewportWidth = config.viewport.width or viewportWidth
+		viewportHeight = config.viewport.height or viewportHeight
+	end
+	self.mobile = config.mobile
+	if self.mobile == nil then
+		self.mobile = Platform.isMobile()
+	end
+	self.fullscreen = self.mobile and config.mobileFullscreen ~= false
+
+	self.width = math.min(config.width or 760, viewportWidth)
+	self.height = math.min(config.height or 520, viewportHeight)
+	if self.fullscreen then
+		self.width, self.height = viewportWidth, viewportHeight
+	end
+	self.radius = self.fullscreen and 0 or (config.radius or 12)
+	self.viewportWidth = viewportWidth
+	self.viewportHeight = viewportHeight
 	self.version = Signal.new(0)
-	self.position = Signal.new(UDim2.new(0.5, 0, 0.5, 0))
+	self.position = Signal.new(self.fullscreen and UDim2.fromOffset(0, 0) or UDim2.new(0.5, 0, 0.5, 0))
 	self.minimized = Signal.new(false)
 	self.toasts = Signal.new({})
 	self.storage = {}
@@ -3320,6 +3371,44 @@ end
 function Web:invalidate()
 	self.version:update(function(value)
 		return value + 1
+	end)
+end
+
+function Web:resize(width, height)
+	width = math.max(1, math.floor(tonumber(width) or self.width))
+	height = math.max(1, math.floor(tonumber(height) or self.height))
+	if width == self.width and height == self.height then
+		return
+	end
+	self.width = width
+	self.height = height
+	self:rebuildStyles()
+	self:invalidate()
+end
+
+function Web:watchViewport()
+	if self.viewportConnection then
+		return
+	end
+	local ok, camera = pcall(function()
+		local workspaceService = game:GetService("Workspace")
+		return workspaceService and workspaceService.CurrentCamera
+	end)
+	if not ok or not camera then
+		return
+	end
+	self.viewportConnection = camera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+		if self.closed then
+			return
+		end
+		local viewportWidth, viewportHeight = Platform.viewportSize()
+		self.viewportWidth = viewportWidth
+		self.viewportHeight = viewportHeight
+		if self.fullscreen then
+			self:resize(viewportWidth, viewportHeight)
+		elseif self.width > viewportWidth or self.height > viewportHeight then
+			self:resize(math.min(self.width, viewportWidth), math.min(self.height, viewportHeight))
+		end
 	end)
 end
 
@@ -3722,7 +3811,7 @@ function Web:submit(node, value)
 end
 
 function Web:beginDrag(node, input)
-	if not input or input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+	if self.fullscreen or not input or input.UserInputType ~= Enum.UserInputType.MouseButton1 then
 		return
 	end
 	local userInputService = game:GetService("UserInputService")
@@ -3762,6 +3851,12 @@ function Web:close()
 		return
 	end
 	self.closed = true
+	if self.viewportConnection then
+		pcall(function()
+			self.viewportConnection:Disconnect()
+		end)
+		self.viewportConnection = nil
+	end
 	if self.handle then
 		self.handle:unmount()
 	end
@@ -3785,6 +3880,10 @@ function Web:view()
 	local minimized = self.minimized:get()
 	local position = self.position:get()
 	local toasts = self.toasts:get()
+	local anchor = self.fullscreen and { 0, 0 } or { 0.5, 0.5 }
+	if self.fullscreen then
+		position = UDim2.fromOffset(0, 0)
+	end
 
 	if minimized then
 		return Components.button({
@@ -3862,7 +3961,7 @@ function Web:view()
 		key = "rauri-window",
 		width = self.width,
 		height = self.height,
-		anchor = { 0.5, 0.5 },
+		anchor = anchor,
 		position = position,
 		clip = true,
 		zIndex = 10,
@@ -3904,6 +4003,7 @@ function Web.app(config)
 	self.gui = gui
 
 	self:start()
+	self:watchViewport()
 
 	local core = config.core or App.new({
 		name = config.title or "Rauri web app",

@@ -22,6 +22,33 @@ function Platform.isExecutor()
 	return globalFunction("gethui") or globalFunction("setclipboard") or globalFunction("readfile")
 end
 
+-- Touch phones and tablets without a hardware keyboard. Executors inherit the
+-- device values, so the same check works in Studio and in games.
+function Platform.isMobile()
+	local ok, input = pcall(function()
+		return game:GetService("UserInputService")
+	end)
+	if not ok or not input then
+		return false
+	end
+	return input.TouchEnabled == true and input.KeyboardEnabled ~= true
+end
+
+-- Camera viewport in pixels, with a desktop fallback for headless runs.
+function Platform.viewportSize()
+	local ok, camera = pcall(function()
+		local workspaceService = game:GetService("Workspace")
+		return workspaceService and workspaceService.CurrentCamera
+	end)
+	if ok and camera then
+		local size = camera.ViewportSize
+		if size and size.X and size.Y and size.X > 0 and size.Y > 0 then
+			return size.X, size.Y
+		end
+	end
+	return 1280, 720
+end
+
 -- The safest container for a Rauri UI: gethui when available (executors keep
 -- it above the game and outside detection), PlayerGui otherwise so Studio and
 -- headless tests keep working.
