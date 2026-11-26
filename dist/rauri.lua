@@ -701,8 +701,10 @@ local function set(instance, property, value)
 end
 
 local function connect(instance, event, fn)
-	local signal = instance[event]
-	if signal and signal.Connect then
+	local ok, signal = pcall(function()
+		return instance[event]
+	end)
+	if ok and signal and signal.Connect then
 		return signal:Connect(fn)
 	end
 	return nil
@@ -1371,8 +1373,12 @@ function Style.apply(instance, style, variant)
 end
 
 local function connect(instance, event, fn)
-	local signal = instance[event]
-	if signal and signal.Connect then
+	-- Not every GuiObject exposes button events (Frame has no
+	-- MouseButton1Down); indexing a missing member errors in Roblox.
+	local ok, signal = pcall(function()
+		return instance[event]
+	end)
+	if ok and signal and signal.Connect then
 		return signal:Connect(fn)
 	end
 	return nil

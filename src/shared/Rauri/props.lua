@@ -57,8 +57,10 @@ local function set(instance, property, value)
 end
 
 local function connect(instance, event, fn)
-	local signal = instance[event]
-	if signal and signal.Connect then
+	local ok, signal = pcall(function()
+		return instance[event]
+	end)
+	if ok and signal and signal.Connect then
 		return signal:Connect(fn)
 	end
 	return nil

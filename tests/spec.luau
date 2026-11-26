@@ -232,6 +232,16 @@ test("fill children respect the parent's padding", function()
 	window:unmount()
 end)
 
+test("style binding tolerates instances without button events", function()
+	local Style = require(ReplicatedStorage.Rauri.style)
+	local strict = setmetatable({}, {
+		__index = function(_, key)
+			error(tostring(key) .. " is not a valid member", 0)
+		end,
+	})
+	Style.bind(strict, {})
+end)
+
 print(string.format("%d passed, %d failed", passed, failed))
 if failed > 0 then
 	error(string.format("%d Rauri tests failed", failed))
