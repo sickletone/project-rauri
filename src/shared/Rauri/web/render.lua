@@ -5,6 +5,7 @@
 -- become real Rauri inputs and data-icon nodes use the Molto icon registry.
 
 local Css = require(script.Parent.css)
+local Html = require(script.Parent.html)
 local Components = require(script.Parent.Parent.components)
 
 local Render = {}
@@ -49,10 +50,11 @@ local function borderFor(style)
 end
 
 local function paint(style, width, height)
+	local alpha = (style.backgroundAlpha or 1) * (style.opacity or 1)
 	if style.gradient then
 		return {
 			bg = style.gradient.from,
-			bgAlpha = 1 - (style.backgroundAlpha or 1),
+			bgAlpha = 1 - alpha,
 			radius = radiusFor(style, width, height),
 			border = borderFor(style),
 			pad = 0,
@@ -60,7 +62,7 @@ local function paint(style, width, height)
 	end
 	return {
 		bg = style.background or false,
-		bgAlpha = 1 - (style.backgroundAlpha or 1),
+		bgAlpha = 1 - alpha,
 		radius = radiusFor(style, width, height),
 		border = borderFor(style),
 		pad = 0,
@@ -81,7 +83,7 @@ function Render.text(box, parentX, parentY, web)
 			font = fontToken(box.style),
 			align = box.style.textAlign,
 			valign = "top",
-			wrap = true,
+			wrap = box.style.whiteSpace ~= "nowrap",
 		},
 	})
 end
@@ -97,6 +99,9 @@ end
 
 local function isInteractive(node)
 	if node.attrs["data-drag"] or node.attrs["data-action"] then
+		return true
+	end
+	if node.tag == "summary" or node.tag == "label" or node.attrs["for"] ~= nil then
 		return true
 	end
 	return next(node.listeners) ~= nil
@@ -138,6 +143,100 @@ function Render.box(box, parentX, parentY, web)
 		})
 	end
 
+	if node.tag == "select" then
+		local options = {}
+		for _, child in ipairs(node.children) do
+			if child.type == "element" and child.tag == "option" then
+				options[#options + 1] = child
+			end
+		end
+		local selectedIndex
+		for index, option in ipairs(options) do
+			local value = option.attrs.value or Html.flattenText(option)
+			if option.attrs.selected ~= nil or (node.value ~= nil and node.value == value) then
+				selectedIndex = index
+				break
+			end
+		end
+		selectedIndex = selectedIndex or 1
+		local selected = options[selectedIndex]
+		local label = selected and (selected.attrs.value or Html.flattenText(selected)) or "Select"
+		if node.value == nil then
+			node.value = selected and (selected.attrs.value or Html.flattenText(selected)) or ""
+		end
+		return Components.button({
+			key = "s" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			text = label .. "  v",
+			style = {
+				bg = style.background or false,
+				bgAlpha = 1 - ((style.backgroundAlpha or 1) * (style.opacity or 1)),
+				fg = style.color,
+				fontSize = math.max(1, math.floor(style.fontSize)),
+				font = fontToken(style),
+				radius = radius,
+				border = borderFor(style),
+				pad = { 8, 0 },
+				align = "left",
+			},
+			onClick = function()
+				web:click(node)
+			end,
+		})
+	end
+
+	if node.tag == "progress" then
+		local maximum = tonumber(attrs.max) or 1
+		local current = tonumber(node.value or attrs.value) or 0
+		local fraction = math.clamp(current / math.max(0.0001, maximum), 0, 1)
+		return Components.frame({
+			key = "p" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			clip = true,
+			style = paint(style, width, height),
+		}, {
+			Components.frame({
+				key = "pf" .. node.id,
+				width = math.max(0, (width - 2) * fraction),
+				height = math.max(0, height - 2),
+				position = UDim2.fromOffset(1, 1),
+				style = { bg = style.color or Color3.fromHex("#6d6dfb"), radius = 999 },
+			}, {}),
+		})
+	end
+
+	if node.tag == "textarea" then
+		return Components.input({
+			key = "t" .. node.id,
+			width = width,
+			height = height,
+			position = position,
+			value = node.value or Html.flattenText(node),
+			multiline = true,
+			placeholder = attrs.placeholder or "",
+			onInput = function(value)
+				web:setInput(node, value)
+			end,
+			onSubmit = function(value)
+				web:submit(node, value)
+			end,
+			style = {
+				bg = style.background or Color3.fromHex("#121218"),
+				bgAlpha = 1 - ((style.backgroundAlpha or 1) * (style.opacity or 1)),
+				fg = style.color,
+				fontSize = math.max(1, math.floor(style.fontSize)),
+				font = fontToken(style),
+				radius = radius,
+				border = borderFor(style),
+				pad = { 8, 6 },
+			},
+		})
+	end
+
 	if node.tag == "input" then
 		local inputType = (attrs.type or "text"):lower()
 		if inputType == "checkbox" then
@@ -166,6 +265,32 @@ function Render.box(box, parentX, parentY, web)
 				props.onHover = hover
 			end
 			return Components.button(props, check)
+		elseif inputType == "radio" then
+			local dot
+			if node.checked then
+				dot = Components.frame({
+					key = "rd" .. node.id,
+					size = math.max(4, math.floor(math.min(width, height) / 2)),
+					anchor = { 0.5, 0.5 },
+					position = { 0.5, 0, 0.5, 0 },
+					style = { bg = style.color or Color3.fromHex("#6d6dfb"), radius = 999 },
+				}, {})
+			end
+			local props = {
+				key = "b" .. node.id,
+				width = width,
+				height = height,
+				position = position,
+				style = paint(style, width, height),
+				onClick = function()
+					web:click(node)
+				end,
+			}
+			local hover = hoverHandler(node, web)
+			if hover then
+				props.onHover = hover
+			end
+			return Components.button(props, dot)
 		elseif inputType == "range" then
 			return Components.slider({
 				key = "r" .. node.id,

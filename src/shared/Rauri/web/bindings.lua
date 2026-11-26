@@ -475,6 +475,29 @@ function Bindings.create(web)
 			end
 			return list
 		end,
+		entries = function(value)
+			local list = Js.array({})
+			if type(value) == "table" then
+				for key, item in value do
+					list[#list + 1] = Js.array({ key, item })
+				end
+			end
+			return list
+		end,
+		fromEntries = function(entries)
+			local object = {}
+			if type(entries) == "table" then
+				for _, pair in entries do
+					if type(pair) == "table" then
+						object[pair[1]] = pair[2]
+					end
+				end
+			end
+			return object
+		end,
+		freeze = function(value)
+			return value
+		end,
 		assign = function(target, ...)
 			for index = 1, select("#", ...) do
 				local source = select(index, ...)
@@ -565,11 +588,62 @@ function Bindings.create(web)
 		end,
 	}
 
+	local arrayHost = {
+		isArray = function(value)
+			return Js.isArray(value)
+		end,
+		from = function(value)
+			local list = Js.array({})
+			if type(value) == "string" then
+				for index = 1, #value do
+					list[#list + 1] = value:sub(index, index)
+				end
+			elseif type(value) == "table" then
+				for _, item in value do
+					list[#list + 1] = item
+				end
+			end
+			return list
+		end,
+	}
+
+	local numberHost = {
+		isInteger = function(value)
+			return type(value) == "number" and value % 1 == 0
+		end,
+		isFinite = function(value)
+			return tonumber(value) ~= nil
+		end,
+		isNaN = function(value)
+			return tonumber(value) == nil
+		end,
+		parseInt = function(value)
+			return tonumber(tostring(value):match("^%s*([%-%+]?%d+)")) or 0
+		end,
+		parseFloat = function(value)
+			return tonumber(tostring(value):match("^%s*([%-%+]?%d*%.?%d+)")) or 0
+		end,
+	}
+
 	local host = {
 		document = documentWrapper,
 		console = console,
 		Math = mathHost,
 		Object = objectHost,
+		Array = arrayHost,
+		Number = numberHost,
+		String = {
+			fromCharCode = function(...)
+				local parts = {}
+				for index = 1, select("#", ...) do
+					local ok, char = pcall(utf8.char, math.floor(tonumber(select(index, ...)) or 0))
+					if ok then
+						parts[#parts + 1] = char
+					end
+				end
+				return table.concat(parts)
+			end,
+		},
 		JSON = jsonHost,
 		parseInt = function(value)
 			local number = tostring(value):match("^%s*([%-%+]?%d+)")

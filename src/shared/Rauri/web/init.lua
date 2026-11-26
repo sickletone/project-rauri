@@ -4,7 +4,9 @@
 -- elements and run JavaScript against a DOM. This is what lets script
 -- developers write UI once in HTML/CSS/JS and load it in an executor.
 --
---   local Rauri = loadstring(game:HttpGet(".../rauri.lua"))()
+--   local Rauri = loadstring(game:HttpGet(
+--     "https://raw.githubusercontent.com/sickletone/project-rauri/main/dist/rauri.lua"
+--   ))()
 --   Rauri.web.app({ title = "My Hub", html = [[ ... ]], css = [[ ... ]], js = [[ ... ]] })
 
 local Html = require(script.html)
@@ -68,7 +70,7 @@ button {
 }
 button:hover { background: var(--border); }
 button:active { background: var(--surface); }
-input {
+input, textarea, select {
   background: var(--panel);
   color: var(--text);
   border: 1px solid var(--border);
@@ -76,6 +78,18 @@ input {
   padding: 7px 10px;
   font-size: 13px;
 }
+table { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+tr { border-bottom: 1px solid var(--border); }
+tr:last-child { border-bottom: 0; }
+td, th { flex: 1; padding: 6px 8px; }
+th { font-weight: 700; }
+select { min-width: 120px; }
+textarea { min-width: 200px; min-height: 60px; }
+summary { font-weight: 600; }
+details:not([open]) > *:not(summary) { display: none; }
+hr { height: 1px; background: var(--border); border: 0; margin: 12px 0; }
+progress { height: 8px; background: var(--surface-alt); border-radius: 999px; overflow: hidden; }
+label { margin-right: 6px; }
 input::placeholder { color: var(--muted); }
 .rauri-window {
   display: flex;
@@ -274,7 +288,7 @@ end
 
 function Web:rebuildStyles()
 	local css = BASE_CSS .. "\n" .. self:themeCss() .. "\n" .. self.styleTags .. "\n" .. (self.config.css or "")
-	self.stylesheet = Css.parse(css)
+	self.stylesheet = Css.parse(css, { width = self.width })
 	self.hoverable = css:find(":hover", 1, true) ~= nil
 end
 
@@ -437,7 +451,62 @@ function Web:click(node)
 	if action then
 		self:action(action)
 	end
-	if node.tag == "input" and (node.attrs.type or "text"):lower() == "checkbox" then
+	local tag = node.tag
+	local inputType = tag == "input" and (node.attrs.type or "text"):lower() or nil
+	if tag == "summary" and node.parent and node.parent.tag == "details" then
+		local details = node.parent
+		details.attrs.open = details.attrs.open ~= nil and nil or ""
+		self:invalidate()
+	elseif tag == "label" and node.attrs["for"] then
+		local target = Dom.querySelector(self.document, "#" .. node.attrs["for"])
+		if target and target ~= node then
+			if target.tag == "input" then
+				target.state.focus = true
+				self:invalidate()
+			else
+				self:click(target)
+			end
+		end
+	elseif tag == "select" then
+		local options = {}
+		for _, child in node.children do
+			if child.type == "element" and child.tag == "option" then
+				options[#options + 1] = child
+			end
+		end
+		if #options > 0 then
+			local index = 1
+			for position, option in options do
+				local value = option.attrs.value or Html.flattenText(option)
+				if option.attrs.selected ~= nil or (node.value ~= nil and node.value == value) then
+					index = position
+					break
+				end
+			end
+			index = index % #options + 1
+			for _, option in options do
+				option.attrs.selected = nil
+			end
+			options[index].attrs.selected = ""
+			local value = options[index].attrs.value or Html.flattenText(options[index])
+			node.value = value
+			self:setInput(node, value)
+			self:dispatch(node, "change", { value = value })
+		end
+	elseif inputType == "radio" then
+		node.checked = true
+		local name = node.attrs.name
+		if name and node.parent then
+			for _, sibling in node.parent.children do
+				if sibling ~= node and sibling.type == "element" and sibling.tag == "input" and sibling.attrs.name == name and (sibling.attrs.type or ""):lower() == "radio" then
+					sibling.checked = false
+				end
+			end
+		end
+		self:invalidate()
+		self:dispatch(node, "input")
+		self:dispatch(node, "change")
+	elseif inputType == "checkbox" then
 		node.checked = not node.checked
 		self:invalidate()
 		self:dispatch(node, "input")

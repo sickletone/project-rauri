@@ -79,6 +79,16 @@ local TAG_DISPLAY = {
 	img = "inline-block",
 	select = "inline-block",
 	textarea = "inline-block",
+	option = "none",
+	tr = "flex",
+	td = "block",
+	th = "block",
+	tbody = "block",
+	thead = "block",
+	summary = "block",
+	details = "block",
+	progress = "inline-block",
+	br = "inline",
 	style = "none",
 	script = "none",
 	head = "none",
@@ -167,6 +177,112 @@ function Css.color(value)
 	return nil, nil
 end
 
+-- calc(): a small recursive-descent evaluator over numbers with units.
+local function calcTokens(text)
+	local tokens = {}
+	local index = 1
+	while index <= #text do
+		local ch = text:sub(index, index)
+		if ch:match("%s") then
+			index += 1
+		elseif ch:match("[%d%.]") then
+			local number, unit, stop = text:match("^([%d%.]+)([%%%a]*)()", index)
+			tokens[#tokens + 1] = { type = "number", value = tonumber(number) or 0, unit = unit:lower() }
+			index = stop
+		else
+			tokens[#tokens + 1] = { type = ch }
+			index += 1
+		end
+	end
+	return tokens
+end
+
+local function parseCalc(text)
+	local tokens = calcTokens(text)
+	local cursor = 1
+	local parseSum
+
+	local function parseAtom()
+		local token = tokens[cursor]
+		if not token then
+			return nil
+		end
+		if token.type == "number" then
+			cursor += 1
+			return { kind = "number", value = token.value, unit = token.unit }
+		elseif token.type == "(" then
+			cursor += 1
+			local inner = parseSum()
+			if tokens[cursor] and tokens[cursor].type == ")" then
+				cursor += 1
+			end
+			return inner
+		end
+		return nil
+	end
+
+	local function parseProduct()
+		local left = parseAtom()
+		while left and tokens[cursor] and (tokens[cursor].type == "*" or tokens[cursor].type == "/") do
+			local operator = tokens[cursor].type
+			cursor += 1
+			local right = parseAtom()
+			if not right then
+				break
+			end
+			left = { kind = "op", op = operator, left = left, right = right }
+		end
+		return left
+	end
+
+	parseSum = function()
+		local left = parseProduct()
+		while left and tokens[cursor] and (tokens[cursor].type == "+" or tokens[cursor].type == "-") do
+			local operator = tokens[cursor].type
+			cursor += 1
+			local right = parseProduct()
+			if not right then
+				break
+			end
+			left = { kind = "op", op = operator, left = left, right = right }
+		end
+		return left
+	end
+
+	return parseSum()
+end
+
+local function evalCalc(node, base, fontSize, rootFontSize)
+	if not node then
+		return 0
+	end
+	if node.kind == "number" then
+		local unit = node.unit
+		if unit == "%" then
+			return (base or 0) * node.value / 100
+		elseif unit == "em" then
+			return node.value * (fontSize or 14)
+		elseif unit == "rem" then
+			return node.value * (rootFontSize or 16)
+		elseif unit == "vw" or unit == "vh" then
+			return (base or 0) * node.value / 100
+		end
+		return node.value
+	end
+	local left = evalCalc(node.left, base, fontSize, rootFontSize)
+	local right = evalCalc(node.right, base, fontSize, rootFontSize)
+	if node.op == "+" then
+		return left + right
+	elseif node.op == "-" then
+		return left - right
+	elseif node.op == "*" then
+		return left * right
+	elseif node.op == "/" and right ~= 0 then
+		return left / right
+	end
+	return 0
+end
+
 -- Returns { value = number, unit = "px"|"%" } or nil ("auto").
 function Css.length(value, fontSize, rootFontSize)
 	if value == nil then
@@ -175,6 +291,13 @@ function Css.length(value, fontSize, rootFontSize)
 	value = tostring(value):gsub("^%s+", ""):gsub("%s+$", "")
 	if value == "" or value == "auto" or value == "none" then
 		return nil
+	end
+	if value:match("^calc%s*%(") then
+		local inner = value:match("^calc%s*%((.*)%)$")
+		local tree = inner and parseCalc(inner)
+		if tree then
+			return { unit = "calc", tree = tree, fontSize = fontSize, rootFontSize = rootFontSize }
+		end
 	end
 	local number, unit = value:match("^([%-%d%.]+)([%%%a]*)$")
 	if not number then
@@ -200,6 +323,9 @@ end
 local function resolveLength(length, base, fallback)
 	if length == nil then
 		return fallback
+	end
+	if length.unit == "calc" then
+		return evalCalc(length.tree, base, length.fontSize, length.rootFontSize)
 	end
 	if length.unit == "%" then
 		return (base or 0) * length.value / 100
@@ -337,7 +463,7 @@ local function parseCompound(text)
 			local close = text:find("]", index, true)
 			if close then
 				local body = text:sub(index + 1, close - 1)
-				local name, operator, value = body:match("^%s*([%w_:%-]+)%s*([%*%^%$~=]?=?)%s*(.-)%s*$")
+								local name, operator, value = body:match("^%s*([%w_:%-]+)%s*([%*%^%$~|!=]?=?)%s*(.-)%s*$")
 				if name then
 					value = value:gsub('^"(.*)"$', "%1"):gsub("^'(.*)'$", "%1")
 					compound.attrs[#compound.attrs + 1] = {
@@ -352,7 +478,15 @@ local function parseCompound(text)
 			local name
 			name, nextIndex = text:match("^:([%w_%-]+)()", index)
 			if name then
-				compound.pseudos[#compound.pseudos + 1] = name:lower()
+				local pseudo = { name = name:lower() }
+				if text:sub(nextIndex, nextIndex) == "(" then
+					local close = text:find(")", nextIndex, true)
+					if close then
+						pseudo.arg = text:sub(nextIndex + 1, close - 1)
+						nextIndex = close + 1
+					end
+				end
+				compound.pseudos[#compound.pseudos + 1] = pseudo
 			end
 		else
 			local name
@@ -387,9 +521,9 @@ local function parseComplex(text)
 		elseif ch == "]" or ch == ")" then
 			depth -= 1
 			buffer ..= ch
-		elseif depth == 0 and ch == ">" then
+		elseif depth == 0 and (ch == ">" or ch == "+" or ch == "~") then
 			flush()
-			tokens[#tokens + 1] = { kind = ">" }
+			tokens[#tokens + 1] = { kind = ch }
 		elseif depth == 0 and ch:match("%s") then
 			flush()
 			if #tokens > 0 and tokens[#tokens].kind ~= " " then
@@ -401,16 +535,20 @@ local function parseComplex(text)
 	end
 	flush()
 
-	local parts = {}
+		local parts = {}
 	for index, token in tokens do
 		if token.kind == "compound" then
 			local combinator = nil
-			local previous = tokens[index - 1]
+			local cursor = index - 1
+			while cursor >= 1 and tokens[cursor].kind == " " do
+				cursor -= 1
+			end
+			local previous = tokens[cursor]
 			if previous then
-				if previous.kind == ">" then
-					combinator = ">"
-				elseif previous.kind == " " then
+				if previous.kind == "compound" then
 					combinator = " "
+				elseif previous.kind == ">" or previous.kind == "+" or previous.kind == "~" then
+					combinator = previous.kind
 				end
 			end
 			parts[#parts + 1] = {
@@ -435,6 +573,59 @@ local function specificityOf(parts)
 		end
 	end
 	return ids * 100 + classes * 10 + tags
+end
+
+local function elementSiblings(node)
+	local list = {}
+	local siblings = node.parent and node.parent.children or {}
+	for _, sibling in siblings do
+		if sibling.type == "element" then
+			list[#list + 1] = sibling
+		end
+	end
+	return list
+end
+
+local function elementIndex(node)
+	for index, sibling in elementSiblings(node) do
+		if sibling == node then
+			return index
+		end
+	end
+	return 0
+end
+
+local function previousElement(node)
+	local previous
+	for _, sibling in node.parent and node.parent.children or {} do
+		if sibling == node then
+			return previous
+		end
+		if sibling.type == "element" then
+			previous = sibling
+		end
+	end
+	return nil
+end
+
+local function matchesNth(pattern, index)
+	pattern = tostring(pattern or ""):gsub("%s+", ""):lower()
+	if pattern == "odd" then
+		return index % 2 == 1
+	elseif pattern == "even" then
+		return index % 2 == 0
+	end
+	local a, b = pattern:match("^([%-%+]?%d*)n([%-%+]?%d+)$")
+	if a then
+		a = a == "" and 1 or (a == "-" and -1 or (a == "+" and 1 or tonumber(a)))
+		b = tonumber(b) or 0
+		if a == 0 then
+			return index == b
+		end
+		local diff = index - b
+		return diff % a == 0 and diff / a >= 0
+	end
+	return tonumber(pattern) == index
 end
 
 local function matchCompound(node, compound, root)
@@ -471,54 +662,95 @@ local function matchCompound(node, compound, root)
 				if value:sub(-#attr.value) ~= attr.value then
 					return false
 				end
+			elseif attr.operator == "~=" then
+				local found = false
+				for word in value:gmatch("[^%s]+") do
+					if word == attr.value then
+						found = true
+						break
+					end
+				end
+				if not found then
+					return false
+				end
+			elseif attr.operator == "|=" then
+				if value ~= attr.value and value:sub(1, #attr.value + 1) ~= attr.value .. "-" then
+					return false
+				end
+			elseif attr.operator == "!=" then
+				if value == attr.value then
+					return false
+				end
 			end
 		end
 	end
 	for _, pseudo in compound.pseudos do
-		if pseudo == "hover" then
-			if not node.state.hover then
+		local name = pseudo.name
+		local matched = false
+		if name == "hover" then
+			matched = node.state.hover == true
+		elseif name == "active" then
+			matched = node.state.active == true
+		elseif name == "focus" then
+			matched = node.state.focus == true
+		elseif name == "focus-within" then
+			local function hasFocus(current)
+				for _, child in current.children do
+					if child.type == "element" then
+						if child.state.focus then
+							return true
+						end
+						if hasFocus(child) then
+							return true
+						end
+					end
+				end
 				return false
 			end
-		elseif pseudo == "active" then
-			if not node.state.active then
-				return false
-			end
-		elseif pseudo == "focus" then
-			if not node.state.focus then
-				return false
-			end
-		elseif pseudo == "checked" then
-			if not node.checked then
-				return false
-			end
-		elseif pseudo == "root" then
-			if node ~= root then
-				return false
-			end
-		elseif pseudo == "first-child" then
-			local siblings = node.parent and node.parent.children or {}
-			local first
-			for _, sibling in siblings do
-				if sibling.type == "element" then
-					first = sibling
+			matched = node.state.focus == true or hasFocus(node)
+		elseif name == "checked" then
+			matched = node.checked == true
+		elseif name == "disabled" then
+			matched = node.attrs.disabled ~= nil
+		elseif name == "enabled" then
+			matched = node.attrs.disabled == nil
+		elseif name == "empty" then
+			matched = true
+			for _, child in node.children do
+				if child.type == "element" or (child.type == "text" and child.text:match("%S")) then
+					matched = false
 					break
 				end
 			end
-			if first ~= node then
-				return false
-			end
-		elseif pseudo == "last-child" then
-			local siblings = node.parent and node.parent.children or {}
-			local last
-			for _, sibling in siblings do
-				if sibling.type == "element" then
-					last = sibling
+		elseif name == "root" then
+			matched = node == root
+		elseif name == "first-child" then
+			matched = elementIndex(node) == 1
+		elseif name == "last-child" then
+			matched = elementIndex(node) == #elementSiblings(node)
+		elseif name == "only-child" then
+			matched = #elementSiblings(node) == 1
+		elseif name == "nth-child" then
+			matched = matchesNth(pseudo.arg, elementIndex(node))
+		elseif name == "nth-last-child" then
+			matched = matchesNth(pseudo.arg, #elementSiblings(node) - elementIndex(node) + 1)
+		elseif name == "not" then
+			matched = true
+			for _, parsed in Css.parseSelector(pseudo.arg or "") do
+				if Css.matchesParts(node, parsed.parts, root) then
+					matched = false
+					break
 				end
 			end
-			if last ~= node then
-				return false
+		elseif name == "is" or name == "where" then
+			for _, parsed in Css.parseSelector(pseudo.arg or "") do
+				if Css.matchesParts(node, parsed.parts, root) then
+					matched = true
+					break
+				end
 			end
-		else
+		end
+		if not matched then
 			return false
 		end
 	end
@@ -536,6 +768,18 @@ local function matchParts(node, parts, index, root)
 	if combinator == ">" then
 		local parent = node.parent
 		return parent ~= nil and parent.type == "element" and matchParts(parent, parts, index - 1, root)
+	elseif combinator == "+" then
+		local previous = previousElement(node)
+		return previous ~= nil and matchParts(previous, parts, index - 1, root)
+	elseif combinator == "~" then
+		local previous = previousElement(node)
+		while previous do
+			if matchParts(previous, parts, index - 1, root) then
+				return true
+			end
+			previous = previousElement(previous)
+		end
+		return false
 	end
 	local ancestor = node.parent
 	while ancestor and ancestor.type == "element" do
@@ -580,7 +824,9 @@ end
 
 -- Stylesheet ------------------------------------------------------------
 
-function Css.parse(source)
+function Css.parse(source, options)
+	options = options or {}
+	local viewportWidth = options.width or 1e6
 	local rules = {}
 	local order = 0
 	local text = tostring(source or ""):gsub("/%*.-%*/", "")
@@ -607,7 +853,30 @@ function Css.parse(source)
 		local body = text:sub(open + 1, cursor - 2)
 		index = cursor
 
-		if selectorText:sub(1, 1) ~= "@" then
+		if selectorText:sub(1, 1) == "@" then
+			local condition = selectorText:match("^@media%s*(.+)$")
+			if condition then
+				local applies = true
+				for prop, amount in condition:gmatch("%(([%w%-]+)%s*:%s*([^%)]+)%)") do
+					local number = tonumber(amount:match("([%d%.]+)"))
+					if number then
+						if prop == "min-width" and viewportWidth < number then
+							applies = false
+						elseif prop == "max-width" and viewportWidth > number then
+							applies = false
+						end
+					end
+				end
+				if applies then
+					local nested = Css.parse(body, options)
+					for _, rule in nested.rules do
+						order += 1
+						rule.order = order
+						rules[#rules + 1] = rule
+					end
+				end
+			end
+		else
 			order += 1
 			rules[#rules + 1] = {
 				selectors = Css.parseSelector(selectorText),
@@ -637,6 +906,23 @@ local DEFAULT_STYLE = {
 	justifyContent = "start",
 	alignItems = "stretch",
 	flexGrow = 0,
+	flexShrink = 1,
+	flexBasis = nil,
+	flexWrap = "nowrap",
+	alignContent = "start",
+	alignSelf = "auto",
+	justifyItems = "stretch",
+	order = 0,
+	aspectRatio = nil,
+	whiteSpace = "normal",
+	textTransform = "none",
+	visibility = "visible",
+	textOverflow = "clip",
+	gridTemplateColumns = nil,
+	gridTemplateRows = nil,
+	gridAutoFlow = "row",
+	gridColumnSpan = 1,
+	gridRowSpan = 1,
 	gap = nil,
 	marginTop = nil,
 	marginRight = nil,
@@ -696,6 +982,24 @@ local function parseGradient(value)
 		return nil
 	end
 	return { angle = angle, from = from, to = to }
+end
+
+local function parseTracks(value)
+	local tracks = {}
+	for token in tostring(value or ""):gmatch("[^%s]+") do
+		local fr = token:match("^([%d%.]+)fr$")
+		if fr then
+			tracks[#tracks + 1] = { kind = "fr", value = tonumber(fr) or 1 }
+		elseif token == "auto" or token == "min-content" or token == "max-content" then
+			tracks[#tracks + 1] = { kind = "auto" }
+		else
+			local length = Css.length(token)
+			if length then
+				tracks[#tracks + 1] = { kind = "fixed", length = length }
+			end
+		end
+	end
+	return tracks
 end
 
 local function applyDeclaration(style, declaration, context)
@@ -818,10 +1122,75 @@ local function applyDeclaration(style, declaration, context)
 	elseif prop == "align-items" then
 		style.alignItems = value
 	elseif prop == "flex" then
-		local numeric = tonumber(value:match("([%d%.]+)"))
-		style.flexGrow = numeric or 1
+		local parts = {}
+		for token in value:gmatch("[^%s]+") do
+			parts[#parts + 1] = token
+		end
+		if #parts == 1 then
+			style.flexGrow = tonumber(parts[1]) or 1
+			style.flexBasis = Css.length("0", fontSize, rootFontSize)
+		else
+			style.flexGrow = tonumber(parts[1]) or 0
+			style.flexShrink = tonumber(parts[2]) or 1
+			if parts[3] and parts[3] ~= "auto" then
+				style.flexBasis = Css.length(parts[3], fontSize, rootFontSize)
+			elseif parts[2] == "0" then
+				style.flexBasis = Css.length("0", fontSize, rootFontSize)
+			end
+		end
 	elseif prop == "flex-grow" then
 		style.flexGrow = tonumber(value) or 0
+	elseif prop == "flex-shrink" then
+		style.flexShrink = tonumber(value) or 1
+	elseif prop == "flex-basis" then
+		style.flexBasis = Css.length(value, fontSize, rootFontSize)
+	elseif prop == "align-content" then
+		style.alignContent = value
+	elseif prop == "align-self" then
+		style.alignSelf = value
+	elseif prop == "justify-items" then
+		style.justifyItems = value
+	elseif prop == "order" then
+		style.order = tonumber(value) or 0
+	elseif prop == "aspect-ratio" then
+		local widthRatio, heightRatio = value:match("^%s*([%d%.]+)%s*/%s*([%d%.]+)%s*$")
+		if widthRatio and heightRatio then
+			style.aspectRatio = (tonumber(widthRatio) or 1) / math.max(0.0001, tonumber(heightRatio) or 1)
+		else
+			style.aspectRatio = tonumber(value)
+		end
+	elseif prop == "white-space" then
+		style.whiteSpace = value
+	elseif prop == "text-transform" then
+		style.textTransform = value
+	elseif prop == "visibility" then
+		style.visibility = value
+	elseif prop == "text-overflow" then
+		style.textOverflow = value
+	elseif prop == "grid-template-columns" then
+		style.gridTemplateColumns = parseTracks(value)
+	elseif prop == "grid-template-rows" then
+		style.gridTemplateRows = parseTracks(value)
+	elseif prop == "grid-auto-flow" then
+		style.gridAutoFlow = value
+	elseif prop == "grid-column" or prop == "grid-row" then
+		local span = tonumber(value:match("span%s*([%d]+)")) or 1
+		if prop == "grid-column" then
+			style.gridColumnSpan = span
+		else
+			style.gridRowSpan = span
+		end
+	elseif prop == "inset" then
+		local top, right, bottom, left = splitSides(value)
+		style.top = Css.length(top, fontSize, rootFontSize)
+		style.right = Css.length(right, fontSize, rootFontSize)
+		style.bottom = Css.length(bottom, fontSize, rootFontSize)
+		style.left = Css.length(left, fontSize, rootFontSize)
+	elseif prop == "background-image" then
+		local gradient = parseGradient(value)
+		if gradient then
+			style.gradient = gradient
+		end
 	elseif prop == "z-index" then
 		style.zIndex = tonumber(value) or 0
 	elseif prop == "opacity" then

@@ -1,5 +1,6 @@
 .tools/
-dist/
+dist/*
+!dist/rauri.lua
 build/
 node_modules/
 RauriDemo.rbxlx

@@ -1,8 +1,9 @@
 --!nolint
 -- Rauri :: web/layout
 -- Turns a computed-style DOM into absolutely positioned boxes.
--- Supports block flow, a single-line flexbox, inline flow with wrapping,
--- relative/absolute positioning, padding/margins/borders, and scrolling.
+-- Supports block flow, flexbox (row/column, wrap, grow/shrink/align), CSS grid,
+-- inline flow, relative/absolute positioning, padding/margins/borders,
+-- aspect ratios and scrolling.
 
 local Css = require(script.Parent.css)
 
@@ -58,6 +59,20 @@ local function normalizeText(text)
 	return normalizeSpace(text):gsub("^%s+", ""):gsub("%s+$", "")
 end
 
+local function displayText(text, style)
+	local transform = style and style.textTransform
+	if transform == "uppercase" then
+		return text:upper()
+	elseif transform == "lowercase" then
+		return text:lower()
+	elseif transform == "capitalize" then
+		return (text:gsub("(%a)([%w']*)", function(first, rest)
+			return first:upper() .. rest
+		end))
+	end
+	return text
+end
+
 local function borderWidth(style)
 	return Css.resolve(style.borderWidth, 1, 0) or 0
 end
@@ -79,7 +94,7 @@ local function verticalInsets(style)
 end
 
 local function isBlockLevel(style)
-	return style.display == "block" or style.display == "flex"
+	return style.display == "block" or style.display == "flex" or style.display == "grid"
 end
 
 local function naturalContentWidth(node, style, computed, maxWidth)
@@ -89,7 +104,7 @@ local function naturalContentWidth(node, style, computed, maxWidth)
 		if text == "" then
 			return 0
 		end
-		return math.min(measure(text, style, 1e6), maxWidth)
+		return math.min(measure(displayText(text, style), style, 1e6), maxWidth)
 	end
 	if node.attrs and node.attrs["data-icon"] then
 		return math.min(style.fontSize, maxWidth)
@@ -107,7 +122,7 @@ local function naturalContentWidth(node, style, computed, maxWidth)
 		elseif child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				inner = math.max(inner, measure(text, style, 1e6))
+				inner = math.max(inner, measure(displayText(text, style), style, 1e6))
 			end
 		end
 	end
@@ -123,7 +138,7 @@ local function intrinsicContentWidth(node, style, computed, maxWidth)
 		if text == "" then
 			return 0
 		end
-		return math.min(measure(text, style, 1e6), maxWidth)
+		return math.min(measure(displayText(text, style), style, 1e6), maxWidth)
 	end
 	if node.attrs and node.attrs["data-icon"] then
 		return math.min(style.fontSize, maxWidth)
@@ -138,7 +153,7 @@ local function intrinsicContentWidth(node, style, computed, maxWidth)
 		elseif child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				inner = math.max(inner, measure(text, style, 1e6))
+				inner = math.max(inner, measure(displayText(text, style), style, 1e6))
 			end
 		end
 	end
@@ -215,6 +230,8 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 		end
 	end
 
+	local nowrap = containerStyle.whiteSpace == "nowrap"
+
 	if allText then
 		local parts = {}
 		local textNode
@@ -225,13 +242,17 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 				textNode = entry.child
 			end
 		end
-		local text = table.concat(parts, " ")
+		local text = displayText(table.concat(parts, " "), containerStyle)
 		if text == "" then
 			return {}, 0
 		end
-		local _, height = measure(text, containerStyle, contentWidth)
+		local limit = nowrap and 1e6 or contentWidth
+		local width, height = measure(text, containerStyle, limit)
+		if nowrap then
+			width = math.min(width, 1e6)
+		end
 		return {
-			textBox(textNode, containerStyle, contentX, contentY, contentWidth, height, text),
+			textBox(textNode, containerStyle, contentX, contentY, width, height, text),
 		}, height
 	end
 
@@ -241,15 +262,22 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 		if child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				local width, height = measure(text, containerStyle, 1e6)
+				local shown = displayText(text, containerStyle)
+				local width, height = measure(shown, containerStyle, 1e6)
 				items[#items + 1] = {
 					kind = "text",
 					node = child,
-					text = text,
+					text = shown,
 					width = width,
 					height = height,
 				}
 			end
+		elseif child.tag == "br" then
+			items[#items + 1] = {
+				kind = "break",
+				width = 0,
+				height = containerStyle.fontSize * (containerStyle.lineHeight or 1.3),
+			}
 		else
 			local style = entry.style
 			local width = Css.resolve(style.width, contentWidth, nil)
@@ -280,15 +308,20 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 	local lines = {}
 	local current = { items = {}, width = 0, height = 0 }
 	for _, item in items do
-		if current.width > 0 and current.width + item.width > contentWidth then
+		if item.kind == "break" then
 			lines[#lines + 1] = current
-			current = { items = {}, width = 0, height = 0 }
+			current = { items = {}, width = 0, height = item.height }
+		else
+			if not nowrap and current.width > 0 and current.width + item.width > contentWidth then
+				lines[#lines + 1] = current
+				current = { items = {}, width = 0, height = 0 }
+			end
+			current.items[#current.items + 1] = item
+			current.width += item.width
+			current.height = math.max(current.height, item.height)
 		end
-		current.items[#current.items + 1] = item
-		current.width += item.width
-		current.height = math.max(current.height, item.height)
 	end
-	if #current.items > 0 then
+	if #current.items > 0 or current.height > 0 then
 		lines[#lines + 1] = current
 	end
 
@@ -307,7 +340,7 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 					item.height,
 					item.text
 				)
-			else
+			elseif item.kind == "element" then
 				local box = item.box
 				if box then
 					shiftBox(box, contentX + offset, contentY + cursorY)
@@ -324,40 +357,53 @@ local function layoutInline(entries, containerStyle, computed, contentX, content
 	return boxes, cursorY
 end
 
-local function layoutFlex(node, entries, style, computed, contentX, contentY, contentWidth, contentHeight)
-	local row = (style.flexDirection or "row") ~= "column"
-	local gap = Css.resolve(style.gap, contentWidth, 0) or 0
+-- Flexbox ----------------------------------------------------------------
+
+local function buildFlexItems(entries, style, computed, contentWidth, contentHeight, row)
 	local absolute = {}
 	local items = {}
+	local counter = 0
 
 	for _, entry in entries do
 		local child, childStyle = entry.child, entry.style
 		if child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				local width, height = measure(text, style, 1e6)
+				local shown = displayText(text, style)
+				local width, height = measure(shown, style, 1e6)
+				counter += 1
 				items[#items + 1] = {
 					kind = "text",
 					node = child,
 					style = style,
-					text = text,
+					text = shown,
 					width = width,
 					height = height,
 					grow = 0,
+					shrink = 1,
+					order = 0,
+					index = counter,
 				}
 			end
 		elseif childStyle.position == "absolute" then
 			absolute[#absolute + 1] = entry
+		elseif child.tag == "br" then
+			-- line breaks do not participate in flex flow
 		else
+			counter += 1
 			local width = Css.resolve(childStyle.width, contentWidth, nil)
 			local height = Css.resolve(childStyle.height, contentHeight, nil)
+			local basis = childStyle.flexBasis and Css.resolve(childStyle.flexBasis, row and contentWidth or contentHeight, nil) or nil
 			if row then
 				if not width then
-					width = intrinsicContentWidth(child, childStyle, computed, contentWidth) + horizontalInsets(childStyle)
+					width = basis or (intrinsicContentWidth(child, childStyle, computed, contentWidth) + horizontalInsets(childStyle))
 				end
 			else
 				if not width then
 					width = contentWidth
+				end
+				if not height then
+					height = basis
 				end
 			end
 			local probe
@@ -373,19 +419,35 @@ local function layoutFlex(node, entries, style, computed, contentX, contentY, co
 				width = width or 0,
 				height = height or 0,
 				grow = childStyle.flexGrow or 0,
+				shrink = childStyle.flexShrink or 1,
+				order = childStyle.order or 0,
+				alignSelf = childStyle.alignSelf,
+				index = counter,
 				box = probe,
 			}
 		end
 	end
 
-	local total = 0
+	table.sort(items, function(a, b)
+		if a.order == b.order then
+			return a.index < b.index
+		end
+		return a.order < b.order
+	end)
+	return items, absolute
+end
+
+local function mainSizeOf(items, row, gap)
+	local total = gap * math.max(0, #items - 1)
 	for _, item in items do
 		total += row and item.width or item.height
 	end
-	total += gap * math.max(0, #items - 1)
+	return total
+end
 
-	local mainSize = row and contentWidth or (contentHeight or total)
-	local free = mainSize - total
+local function distributeLine(items, limit, row, gap)
+	local total = mainSizeOf(items, row, gap)
+	local free = limit - total
 	if free > 0 then
 		local growTotal = 0
 		for _, item in items do
@@ -397,85 +459,75 @@ local function layoutFlex(node, entries, style, computed, contentX, contentY, co
 			for _, item in items do
 				if (item.grow or 0) > 0 then
 					local extra = free * item.grow / growTotal
-					if row then
-						item.width += extra
-					else
-						item.height += extra
-					end
+					item.width += extra
 				end
 			end
 			free = 0
 		end
 	elseif free < 0 then
-		-- flex-shrink: growable children (flex: 1) give space back first.
 		local shrinkTotal = 0
 		for _, item in items do
-			if (item.grow or 0) > 0 then
-				shrinkTotal += 1
-			end
+			shrinkTotal += (item.shrink or 1) * math.max(1, row and item.width or item.height)
 		end
 		if shrinkTotal > 0 then
 			for _, item in items do
-				if (item.grow or 0) > 0 then
-					local reduction = -free / shrinkTotal
-					if row then
-						item.width = math.max(0, item.width - reduction)
-					else
-						item.height = math.max(0, item.height - reduction)
-					end
+				local weight = (item.shrink or 1) * math.max(1, row and item.width or item.height)
+				local reduction = math.min(row and item.width or item.height, -free * weight / shrinkTotal)
+				if row then
+					item.width -= reduction
+				else
+					item.height -= reduction
 				end
 			end
-			free = 0
 		end
+		free = math.min(0, limit - mainSizeOf(items, row, gap))
 	end
+	return free
+end
 
+local function placeLine(items, style, row, x0, y0, contentWidth, contentHeight, lineCross, gap, limit)
+	local free = distributeLine(items, limit, row, gap)
 	local cursor = alignOffset(style.justifyContent, math.max(0, free))
 	local spacing = 0
 	if style.justifyContent == "space-between" and #items > 1 and free > 0 then
 		spacing = free / (#items - 1)
 		cursor = 0
-	end
-
-	local crossSize
-	if row then
-		crossSize = contentHeight
-		if not crossSize then
-			crossSize = 0
-			for _, item in items do
-				crossSize = math.max(crossSize, item.height)
-			end
-		end
-	else
-		crossSize = contentWidth
+	elseif style.justifyContent == "space-around" and #items > 0 and free > 0 then
+		spacing = free / #items
+		cursor = spacing / 2
 	end
 
 	local boxes = {}
 	for _, item in items do
+		local align = item.alignSelf
+		if align == nil or align == "auto" then
+			align = style.alignItems
+		end
 		local childWidth, childHeight = item.width, item.height
-		if style.alignItems == "stretch" then
+		if align == "stretch" then
 			if row and Css.resolve(item.style.height, contentHeight, nil) == nil then
-				childHeight = crossSize
+				childHeight = math.max(childHeight, lineCross)
 			elseif not row and Css.resolve(item.style.width, contentWidth, nil) == nil then
-				childWidth = crossSize
+				childWidth = math.max(childWidth, lineCross)
 			end
 		end
 
-		local x = contentX + (row and cursor or 0)
-		local y = contentY + (row and 0 or cursor)
+		local x = x0 + (row and cursor or 0)
+		local y = y0 + (row and 0 or cursor)
 		if row then
 			local offset = 0
-			if style.alignItems == "center" then
-				offset = (crossSize - childHeight) / 2
-			elseif style.alignItems == "end" then
-				offset = crossSize - childHeight
+			if align == "center" then
+				offset = (lineCross - childHeight) / 2
+			elseif align == "end" then
+				offset = lineCross - childHeight
 			end
 			y += offset
 		else
 			local offset = 0
-			if style.alignItems == "center" then
-				offset = (crossSize - childWidth) / 2
-			elseif style.alignItems == "end" then
-				offset = crossSize - childWidth
+			if align == "center" then
+				offset = (lineCross - childWidth) / 2
+			elseif align == "end" then
+				offset = lineCross - childWidth
 			end
 			x += offset
 		end
@@ -495,15 +547,216 @@ local function layoutFlex(node, entries, style, computed, contentX, contentY, co
 
 		cursor += (row and childWidth or childHeight) + gap + spacing
 	end
-
-	local height
-	if row then
-		height = crossSize
-	else
-		height = cursor - gap - spacing
-	end
-	return boxes, height, absolute
+	return boxes, cursor - gap - spacing
 end
+
+local function layoutFlex(node, entries, style, computed, contentX, contentY, contentWidth, contentHeight)
+	local row = (style.flexDirection or "row") ~= "column"
+	local gap = Css.resolve(style.gap, row and contentWidth or contentHeight, 0) or 0
+	local items, absolute = buildFlexItems(entries, style, computed, contentWidth, contentHeight, row)
+	if #items == 0 then
+		return {}, 0, absolute
+	end
+
+	local wrap = style.flexWrap == "wrap" or style.flexWrap == "wrap-reverse"
+	local limit = row and contentWidth or contentHeight
+	local lines = {}
+
+	if wrap and limit then
+		local current = {}
+		local used = 0
+		for _, item in items do
+			local size = row and item.width or item.height
+			if #current > 0 and used + gap + size > limit then
+				lines[#lines + 1] = current
+				current = {}
+				used = 0
+			end
+			used += size + (#current > 0 and gap or 0)
+			current[#current + 1] = item
+		end
+		if #current > 0 then
+			lines[#lines + 1] = current
+		end
+	else
+		lines[1] = items
+	end
+
+	local lineCross = {}
+	local totalCross = 0
+	for index, line in lines do
+		local cross = 0
+		for _, item in line do
+			cross = math.max(cross, row and item.height or item.width)
+		end
+		lineCross[index] = cross
+		totalCross += cross
+	end
+	if #lines > 1 then
+		totalCross += gap * (#lines - 1)
+	end
+
+	-- align-content only matters when there is extra cross space (wrap).
+	local startOffset = 0
+	local lineSpacing = gap
+	local extra = (contentHeight and wrap) and (contentHeight - totalCross) or 0
+	if extra > 0 and #lines > 0 then
+		local align = style.alignContent or "start"
+		if align == "center" then
+			startOffset = extra / 2
+		elseif align == "end" then
+			startOffset = extra
+		elseif align == "space-between" and #lines > 1 then
+			lineSpacing = gap + extra / (#lines - 1)
+		elseif align == "space-around" then
+			lineSpacing = gap + extra / #lines
+			startOffset = extra / (#lines * 2)
+		elseif align == "stretch" then
+			for index in lineCross do
+				lineCross[index] += extra / #lines
+			end
+		end
+	end
+
+	local boxes = {}
+	local y = contentY + startOffset
+	for index, line in lines do
+		local placed, _ = placeLine(
+			line,
+			style,
+			row,
+			contentX,
+			y,
+			contentWidth,
+			contentHeight,
+			lineCross[index],
+			gap,
+			row and contentWidth or (contentHeight or mainSizeOf(line, row, gap))
+		)
+		for _, box in placed do
+			boxes[#boxes + 1] = box
+		end
+		y += lineCross[index] + lineSpacing
+	end
+
+	if #lines > 0 then
+		y -= lineSpacing
+	end
+	return boxes, y - contentY, absolute
+end
+
+-- Grid -------------------------------------------------------------------
+
+local function resolveTracks(tracks, available, gap)
+	local columns = {}
+	if not tracks or #tracks == 0 then
+		tracks = { { kind = "fr", value = 1 } }
+	end
+	local fixed = 0
+	local frTotal = 0
+	local autoCount = 0
+	for _, track in tracks do
+		if track.kind == "fixed" then
+			fixed += Css.resolve(track.length, available, 0) or 0
+		elseif track.kind == "fr" then
+			frTotal += track.value
+		else
+			autoCount += 1
+		end
+	end
+	local free = math.max(0, available - fixed - gap * math.max(0, #tracks - 1))
+	local perFr = frTotal > 0 and free / frTotal or 0
+	local perAuto = autoCount > 0 and free / autoCount or 0
+	for _, track in tracks do
+		if track.kind == "fixed" then
+			columns[#columns + 1] = Css.resolve(track.length, available, 0) or 0
+		elseif track.kind == "fr" then
+			columns[#columns + 1] = perFr * track.value
+		else
+			columns[#columns + 1] = perAuto
+		end
+	end
+	return columns
+end
+
+local function layoutGrid(node, entries, style, computed, contentX, contentY, contentWidth, contentHeight)
+	local gap = Css.resolve(style.gap, contentWidth, 0) or 0
+	local columns = resolveTracks(style.gridTemplateColumns, contentWidth, gap)
+	local absolute = {}
+	local flow = {}
+	for _, entry in entries do
+		if entry.child.type == "element" and entry.style.position == "absolute" then
+			absolute[#absolute + 1] = entry
+		elseif entry.child.type == "element" and entry.child.tag == "br" then
+			-- ignore
+		elseif entry.child.type == "text" and normalizeText(entry.child.text) == "" then
+			-- whitespace between cells is not a grid item
+		else
+			flow[#flow + 1] = entry
+		end
+	end
+
+	local rows = {}
+	local cursor = 1
+	while cursor <= #flow do
+		local row = {}
+		local height = 0
+		for column = 1, #columns do
+			local entry = flow[cursor]
+			if not entry then
+				break
+			end
+			cursor += 1
+			local child = entry.child
+			local childStyle = entry.style
+			if child.type == "text" then
+				local text = normalizeText(child.text)
+				if text ~= "" then
+					local shown = displayText(text, style)
+					local width, measured = measure(shown, style, columns[column])
+					row[#row + 1] = { kind = "text", node = child, style = style, text = shown, width = math.min(width, columns[column]), height = measured, column = column }
+					height = math.max(height, measured)
+				end
+			else
+				local width = Css.resolve(childStyle.width, columns[column], nil) or columns[column]
+				local box = layoutElement(child, childStyle, 0, 0, width, nil, width, nil)
+				row[#row + 1] = { kind = "element", box = box, width = width, height = box.height, column = column }
+				height = math.max(height, box.height)
+			end
+		end
+		rows[#rows + 1] = { items = row, height = height }
+	end
+
+	local boxes = {}
+	local y = 0
+	for index, row in rows do
+		local rowHeight = row.height
+		local explicit = style.gridTemplateRows and style.gridTemplateRows[index]
+		if explicit then
+			local size = Css.resolve(explicit.length, contentHeight, rowHeight) or rowHeight
+			rowHeight = math.max(rowHeight, size)
+		end
+		local x = 0
+		for _, cell in row.items do
+			if cell.kind == "text" then
+				boxes[#boxes + 1] = textBox(cell.node, cell.style, contentX + x, contentY + y, cell.width, cell.height, cell.text)
+			else
+				local box = cell.box
+				if math.abs(box.height - rowHeight) > 0.01 and Css.resolve(box.style.height, contentHeight, nil) == nil then
+					box = layoutElement(box.node, box.style, 0, 0, cell.width, rowHeight, cell.width, rowHeight)
+				end
+				shiftBox(box, contentX + x, contentY + y)
+				boxes[#boxes + 1] = box
+			end
+			x += columns[cell.column] + gap
+		end
+		y += rowHeight + gap
+	end
+
+	return boxes, math.max(0, y - gap), absolute
+end
+
+-- Block flow -------------------------------------------------------------
 
 local function layoutBlock(entries, containerStyle, computed, contentX, contentY, contentWidth, contentHeightAvailable)
 	local boxes = {}
@@ -515,10 +768,14 @@ local function layoutBlock(entries, containerStyle, computed, contentX, contentY
 		if child.type == "text" then
 			local text = normalizeText(child.text)
 			if text ~= "" then
-				local _, height = measure(text, containerStyle, contentWidth)
-				boxes[#boxes + 1] = textBox(child, containerStyle, contentX, contentY + cursorY, contentWidth, height, text)
+				local shown = displayText(text, containerStyle)
+				local limit = containerStyle.whiteSpace == "nowrap" and 1e6 or contentWidth
+				local width, height = measure(shown, containerStyle, limit)
+				boxes[#boxes + 1] = textBox(child, containerStyle, contentX, contentY + cursorY, width, height, shown)
 				cursorY += height
 			end
+		elseif child.tag == "br" then
+			cursorY += containerStyle.fontSize * (containerStyle.lineHeight or 1.3)
 		elseif childStyle.position == "absolute" then
 			absolute[#absolute + 1] = entry
 		else
@@ -629,6 +886,18 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 			contentWidth,
 			forcedHeight and math.max(0, forcedHeight - vertical) or nil
 		)
+	elseif style.display == "grid" then
+		local entries = visibleEntries(node, computedRef)
+		children, contentHeight, absolute = layoutGrid(
+			node,
+			entries,
+			style,
+			computedRef,
+			contentX,
+			contentY,
+			contentWidth,
+			forcedHeight and math.max(0, forcedHeight - vertical) or nil
+		)
 	else
 		local entries = visibleEntries(node, computedRef)
 		local hasBlock = false
@@ -654,6 +923,10 @@ layoutElement = function(node, style, x, y, availableWidth, availableHeight, for
 	end
 
 	local heightSpec = forcedHeight or Css.resolve(style.height, availableHeight, nil)
+	if not heightSpec and style.aspectRatio and style.aspectRatio > 0 then
+		local ratioHeight = borderBoxWidth / style.aspectRatio
+		heightSpec = style.boxSizing == "border-box" and ratioHeight or (ratioHeight - vertical)
+	end
 	local borderBoxHeight
 	if heightSpec then
 		borderBoxHeight = style.boxSizing == "border-box" and heightSpec or heightSpec + vertical

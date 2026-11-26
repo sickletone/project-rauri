@@ -6,7 +6,9 @@ result renders through the same Rauri elements as `ui.*`, which means it works
 anywhere Rauri runs — **script executors included**, not just Studio.
 
 ```lua
-local Rauri = loadstring(game:HttpGet("<url to dist/rauri.lua>"))()
+local Rauri = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/sickletone/project-rauri/main/dist/rauri.lua"
+))()
 
 local app = Rauri.web.app({
     title = "My Hub",
@@ -44,20 +46,42 @@ node scripts/bundle.mjs --entry src/shared/Rauri/init.lua \
   --out dist/rauri.lua --alias ReplicatedStorage=src/shared
 ```
 
-Upload `dist/rauri.lua` somewhere reachable and load it from an executor:
+The repo publishes the built bundle at `dist/rauri.lua`, so an executor can load it directly:
 
 ```lua
-local Rauri = loadstring(game:HttpGet("<url to rauri.lua>"))()
-local buildHub = loadstring(game:HttpGet("<url to examples/WebHub.lua>"))()
-buildHub(Rauri)
-```
+local Rauri = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/sickletone/project-rauri/main/dist/rauri.lua"
+))()
 
-Or write the app inline:
-
-```lua
-local Rauri = loadstring(game:HttpGet("<url to rauri.lua>"))()
 Rauri.web.app({ title = "Hub", html = "<h1>Hi</h1>" })
 ```
+
+The example hub loads itself (framework + example) in one line:
+
+```lua
+loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/sickletone/project-rauri/main/examples/WebHubLoader.lua"
+))()
+```
+
+Or load the pieces yourself:
+
+```lua
+local Rauri = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/sickletone/project-rauri/main/dist/rauri.lua"
+))()
+local buildHub = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/sickletone/project-rauri/main/examples/WebHub.lua"
+))()
+buildHub(Rauri) -- returns the mounted app
+```
+
+If `raw.githubusercontent.com` is blocked, the same files are on jsDelivr:
+replace `https://raw.githubusercontent.com/sickletone/project-rauri/main` with
+`https://cdn.jsdelivr.net/gh/sickletone/project-rauri@main`.
+
+Rebuild `dist/rauri.lua` after framework changes so the published bundle matches
+the source.
 
 `Rauri.web.app(config)` creates a `ScreenGui`, chooses its parent via the
 platform layer (`gethui` → `PlayerGui`), protects it where the
@@ -106,11 +130,18 @@ A forgiving parser: tags, attributes (quoted or not), void elements, comments,
 entities (`&amp;`, `&#x1F600;`), raw `<style>`/`<script>`/`<title>`/`<textarea>`.
 Unknown tags are block elements by default.
 
-- `<div>`, `<p>`, headings, `<ul>/<li>`, `<section>`, `<article>` and friends are blocks.
+- `<div>`, `<p>`, headings, `<ul>/<li>`, `<section>`, `<article>`, `<details>` and friends are blocks.
 - `<span>`, `<a>`, `<b>`, `<strong>`, `<em>`, `<i>`, `<code>`, `<label>` are inline.
-- `<button>`, `<input>`, `<img>` are inline-block controls.
-- `<input type="text">`, `type="checkbox"` and `type="range"` render real Rauri inputs.
+- `<button>`, `<input>`, `<img>`, `<select>`, `<textarea>` are inline-block controls.
+- `<input type="text|checkbox|radio|range">` render real Rauri controls; a
+  `radio` group shares `name` and only one stays checked.
 - `<img src="...">` renders an image (Roblox asset ids/URLs; nothing is fetched).
+- `<textarea>` is a multi-line input; `<select>`/`<option>` render a control that
+  cycles options on click and fires `input` + `change`.
+- `<table>`/`<tr>`/`<td>`/`<th>` lay out as equal-width rows.
+- `<details>`/`<summary>` collapse their body until the summary is clicked.
+- `<progress value max>` renders a bar, `<br>` forces a line break and `<hr>` a divider.
+- `<label for="id">` focuses or clicks its target.
 
 Attributes that drive behaviour:
 
@@ -125,32 +156,40 @@ Attributes that drive behaviour:
 ## CSS
 
 Selectors: `*`, `tag`, `.class`, `#id`, `[attr]`, `[attr=value]` (`*=`, `^=`,
-`$=`), `:hover`, `:active`, `:focus`, `:checked`, `:root`, `:first-child`,
-`:last-child`, descendant and `>` combinators, comma groups. Cascade is by
-specificity then source order, with inline styles last.
+`$=`, `~=`, `|=`, `!=`), `:hover`, `:active`, `:focus`, `:focus-within`,
+`:checked`, `:disabled`, `:enabled`, `:empty`, `:root`, `:first-child`,
+`:last-child`, `:only-child`, `:nth-child(an+b)`, `:nth-last-child()`,
+`:not(selector)`, `:is()`/`:where()`, descendant, `>`, `+` and `~` combinators,
+comma groups. Cascade is by specificity then source order, with inline styles
+last. `@media (min-width|max-width: Npx) { ... }` is evaluated against the
+window width when the stylesheet is built.
 
 Layout properties:
 
-- `display`: `block`, `flex`, `inline`, `inline-block`, `none`
-- `position`: `static`, `absolute` (with `top`/`right`/`bottom`/`left`)
-- flexbox subset: `flex-direction` (row/column), `justify-content`
-  (`start`, `center`, `end`, `space-between`), `align-items`
-  (`start`, `center`, `end`, `stretch`), `flex`/`flex-grow`, `gap`
-- `width`, `height`, `min-*`, `max-*`, `margin`, `padding`, `box-sizing`
+- `display`: `block`, `flex`, `grid`, `inline`, `inline-block`, `none`
+- `position`: `static`, `absolute` (with `top`/`right`/`bottom`/`left`/`inset`)
+- flexbox: `flex-direction` (row/column), `justify-content` (`start`, `center`,
+  `end`, `space-between`, `space-around`), `align-items`/`align-self`/
+  `align-content` (`start`, `center`, `end`, `stretch`), `flex`/`flex-grow`/
+  `flex-shrink`/`flex-basis`, `flex-wrap: wrap`, `order`, `gap`
+- grid: `grid-template-columns`/`grid-template-rows` (`px`, `%`, `fr`, `auto`),
+  row-major auto-placement, `gap`
+- `width`, `height`, `min-*`, `max-*`, `aspect-ratio`, `margin`, `padding`,
+  `box-sizing`
 - `border` (width style color), `border-*`, `border-radius` (px or `%`)
 - `overflow` / `overflow-y` (`auto`, `scroll`, `hidden`) become scroll frames
+- `opacity` (background alpha), `z-index`
 
 Paint and text:
 
-- `background` (color or `linear-gradient(angle, from, to)`), `color`
+- `background` / `background-image` (color or `linear-gradient(angle, from, to)`), `color`
 - `font-size`, `font-weight` (400–900), `font-family` (`sans`/`mono` only)
-- `line-height`, `text-align`
-- `z-index`
+- `line-height`, `text-align`, `text-transform`, `white-space: nowrap`
 - CSS variables: `--name`, `var(--name, fallback)`
 
-Units: `px`, `%`, `em`, `rem`; `vw`/`vh` are resolved against the containing
-base. No `calc()`, flex-wrap, grid, transitions, animations, media queries or
-pseudo-elements.
+Units: `px`, `%`, `em`, `rem`, `vw`/`vh` and `calc()` (`+ - * /`, parentheses).
+No transitions, animations, `@keyframes`, `::before`/`::after`, `@supports`,
+`@import`, `float` or `position: sticky/fixed`.
 
 Because layout is computed to pixels and rendered on Roblox, text alignment and
 wrapping come from `TextService:GetTextSize`; weights map to Gotham faces and
@@ -158,28 +197,39 @@ wrapping come from `TextService:GetTextSize`; weights map to Gotham faces and
 
 ## JavaScript
 
-An ES2017-ish interpreter, not a full engine. It supports:
+An ES2019-ish interpreter, not a full engine. It supports:
 
 - `let`/`const`/`var`, blocks and function scope
-- functions, arrow functions, closures (per-iteration bindings in `for...of`)
-- `if`/`else`, `while`, classic `for`, `for...of`, `for...in`,
+- functions, arrow functions (lexical `this`), closures (per-iteration bindings
+  in `for...of`), default/rest parameters, destructured parameters
+- `class` with `constructor`, instance/static methods and fields, `extends`,
+  `super(...)` and `super.method()`, `new`, `this`, `instanceof`
+- destructuring declarations (`const { a, b: c = 1, ...rest } = obj`,
+  `const [first, , third, ...tail] = list`)
+- spread in arrays, objects and calls; rest parameters
+- optional chaining (`a?.b?.[c]?.()`) and nullish coalescing (`??`, `??=`)
+- `if`/`else`, `while`, `do...while`, classic `for`, `for...of`, `for...in`,
+  `switch`/`case` (with fallthrough), `try`/`catch`/`finally`, `throw`,
   `break`, `continue`, `return`
-- ternary, `typeof`, `&&`/`||` short-circuiting, `+ - * / %`, comparisons,
-  `===`/`!==`, assignments including `+=`, `++`/`--`
-- strings, numbers, booleans, `null`/`undefined`, arrays, object literals,
-  template strings with `${...}`
-- `Math`, `Object.keys/values/assign`, `JSON.parse/stringify` (through
+- ternary, `typeof`, `delete`, `in`, `void`, `&&`/`||`/`??` short-circuiting,
+  `+ - * / % **`, comparisons, `===`/`!==`, assignments including `+=`/`??=`,
+  `++`/`--`
+- strings, numbers, booleans, `null`/`undefined`, arrays, object literals with
+  shorthand/methods/computed keys, template strings with `${...}`
+- `Math`, `Object.keys/values/entries/assign`, `JSON.parse/stringify` (through
   `HttpService` when available), `parseInt`, `parseFloat`, `isNaN`,
   `setTimeout`, `clearTimeout`, `console`, `localStorage`
 - array methods: `push`, `pop`, `shift`, `unshift`, `join`, `forEach`, `map`,
-  `filter`, `find`, `some`, `every`, `slice`, `concat`, `reverse`, `indexOf`,
-  `includes`; string methods: `trim`, `split`, `replace`, `includes`,
-  `startsWith`, `endsWith`, `substring`, `slice`, `charAt`, `indexOf`, `repeat`,
+  `filter`, `find`, `findIndex`, `some`, `every`, `reduce`, `slice`, `splice`,
+  `concat`, `reverse`, `sort`, `flat`, `at`, `indexOf`, `includes`; string
+  methods: `trim`, `trimStart`, `trimEnd`, `split`, `replace`, `replaceAll`,
+  `includes`, `startsWith`, `endsWith`, `substring`, `slice`, `charAt`,
+  `charCodeAt`, `indexOf`, `repeat`, `padStart`, `padEnd`, `concat`,
   `toUpperCase`, `toLowerCase`
 
-Not supported: classes/`new`, `async`/promises, regex literals, destructuring,
-spread, optional chaining, `this`, `switch`, `try/catch`, `getters/setters`,
-generators. Script errors go to `onLog` (or `warn`).
+Not supported: regex literals, `async`/`await`/promises, generators, getters and
+setters, tagged templates, labels, `with`, BigInt. Script errors go to `onLog`
+(or `warn`).
 
 ### DOM
 
@@ -298,11 +348,12 @@ node scripts/bundle.mjs --entry examples/WebHub.lua \
 
 ## Limits
 
-- This is a UI engine, not a browser: no network stack, media, forms
-  submission, navigation or real `<a href>`.
-- Layout is single-pass with a flex subset; there is no text shaping beyond
-  Roblox's and no sub-pixel positioning.
-- The JS engine is deliberately small; check the list above before relying on a
-  modern syntax feature.
+- This is a UI engine, not a browser: no network stack, media playback,
+  canvas, iframes, form submission, navigation or real `<a href>`.
+- Layout is single-pass: no `float`, no sticky/fixed positioning, grid spans are
+  ignored, and there is no text shaping beyond Roblox's.
+- No CSS transitions/animations, pseudo-elements, `@supports` or `@import`.
+- The JS engine covers the listed syntax; regex literals and async code are the
+  main gaps.
 - Executor APIs differ between vendors; the platform layer degrades gracefully
   and never requires them.

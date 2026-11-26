@@ -102,11 +102,12 @@ document.getElementById("go").addEventListener("click", () => {
 ```
 
 - `Rauri.web.app(config)` mounts a `ScreenGui` (gethui under an executor, PlayerGui otherwise) and returns `web`, `core`, `gui` and `window`.
-- Layout: block, flex and inline flow, absolute positioning, margins/padding/borders/radius, gradients, CSS variables, hover/focus/checked states, text wrapping, scroll frames and Molto icons via `data-icon`.
-- JavaScript: functions and arrows, loops, arrays/objects, template strings, DOM queries and events, `rauri.command/notify/theme/storage/on`, and `localStorage`.
+- Layout: block, flexbox (wrap, grow/shrink, align/order), CSS grid, inline flow, absolute positioning, `calc()`, media queries, margins/padding/borders/radius, gradients, CSS variables, `:not`/`:nth-child`/sibling selectors, hover/focus/checked states, text wrapping, scroll frames and Molto icons via `data-icon`.
+- HTML controls: text/checkbox/radio/range inputs, `<textarea>`, `<select>`, `<table>`, `<details>`, `<progress>`, `<br>`/`<hr>` and `<label for>`.
+- JavaScript: classes with `extends`/`super`, `this`/`new`, destructuring, spread/rest, optional chaining, `??`, `switch`, `try/catch`, loops, arrays/objects, template strings, DOM queries and events, `rauri.command/notify/theme/storage/on`, and `localStorage`.
 - Customize everything: `chrome = false` for your own titlebar, `theme` variables, any HTML/CSS/JS, Luau DOM access (`Rauri.web.dom`), commands and capabilities, host hooks (`onLog`, `onInput`, `onClose`).
 
-The full supported subset and API are in [docs/WEB.md](docs/WEB.md); `examples/WebHub.lua` is a complete executor hub you can load or copy.
+The full supported subset and API are in [docs/WEB.md](docs/WEB.md); `examples/WebHub.lua` is a complete executor hub (run `examples/WebHubLoader.lua` to load it in one line).
 
 ### Executors
 
@@ -190,12 +191,25 @@ node scripts/bundle.mjs --entry src/shared/Rauri/init.lua \
   --out dist/rauri.lua --alias ReplicatedStorage=src/shared
 ```
 
-The output is one Luau file whose return value is the `Rauri` table, ready for an executor:
+The output is one Luau file whose return value is the `Rauri` table. This repo publishes the current build at `dist/rauri.lua`, so an executor can load it straight from GitHub:
 
 ```lua
-local Rauri = loadstring(game:HttpGet("<url to dist/rauri.lua>"))()
+local Rauri = loadstring(game:HttpGet(
+  "https://raw.githubusercontent.com/sickletone/project-rauri/main/dist/rauri.lua"
+))()
+
 Rauri.web.app({ title = "Hub", html = "<h1>Hello</h1>" })
 ```
+
+The example hub is one script as well:
+
+```lua
+loadstring(game:HttpGet(
+  "https://raw.githubusercontent.com/sickletone/project-rauri/main/examples/WebHubLoader.lua"
+))()
+```
+
+If `raw.githubusercontent.com` is blocked in your executor, use the jsDelivr mirror instead: `https://cdn.jsdelivr.net/gh/sickletone/project-rauri@main/dist/rauri.lua`.
 
 ## Tests
 
@@ -209,12 +223,18 @@ node scripts/bundle.mjs --entry tests/demo.luau --prepend tests/mock.luau \
 node scripts/bundle.mjs --entry tests/web.luau --prepend tests/mock.luau \
   --alias ReplicatedStorage=src/shared --out dist/webtest.luau && luau dist/webtest.luau
 
+node scripts/bundle.mjs --entry tests/js.luau --prepend tests/mock.luau \
+  --alias ReplicatedStorage=src/shared --out dist/jstest.luau && luau dist/jstest.luau
+
+node scripts/bundle.mjs --entry tests/css.luau --prepend tests/mock.luau \
+  --alias ReplicatedStorage=src/shared --out dist/csstest.luau && luau dist/csstest.luau
+
 node scripts/bundle.mjs --entry tests/example.luau --prepend tests/mock.luau \
   --alias ReplicatedStorage=src/shared --alias Examples=examples \
   --out dist/example.luau && luau dist/example.luau
 ```
 
-`tests/mock.luau` implements the slice of the Roblox API Rauri touches (instances, signals, enums, UDim2, Color3, services, task). The demo test boots Rauri Studio, navigates every page, switches icon providers, searches, triggers a capability denial and exercises minimize/close/reopen. The web test covers the parser, cascade, layout, JS events, theme variables and ScreenGui mounting; the example test drives the executor hub end to end.
+`tests/mock.luau` implements the slice of the Roblox API Rauri touches (instances, signals, enums, UDim2, Color3, services, task). The demo test boots Rauri Studio, navigates every page, switches icon providers, searches, triggers a capability denial and exercises minimize/close/reopen. The web test covers the parser, cascade, layout, JS events, theme variables and ScreenGui mounting; `tests/js.luau` covers the language (classes, destructuring, optional chaining, switch, try/catch) and `tests/css.luau` covers flex-wrap, grid, `calc()`, selectors, media queries and the HTML controls; the example test drives the executor hub end to end.
 
 ## Demo
 

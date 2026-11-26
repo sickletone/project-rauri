@@ -1,15 +1,16 @@
 --!nolint
 -- Rauri :: web/js
--- A small JavaScript interpreter (an ES2017-ish subset) used by the web view.
--- It is intentionally not a full engine: expressions, functions, arrows,
--- control flow, arrays, objects, template strings and the host API cover the
--- kind of scripts UI developers write against the DOM.
+-- A JavaScript interpreter used by the web view. It covers the practical ES2019
+-- surface UI scripts use: classes with inheritance, this/new, destructuring,
+-- spread/rest, optional chaining, nullish coalescing, switch, try/catch, the
+-- common array/string/number methods and a DOM provided by the host.
 --
+-- Not implemented: regex literals, async/await, generators, proxies.
 -- The host API is injected by web/bindings.lua as a plain table of globals.
 
 local Js = {}
 
-local MAX_STEPS = 2000000
+local MAX_STEPS = 3000000
 
 local KEYWORDS = {
 	["let"] = true,
@@ -23,6 +24,7 @@ local KEYWORDS = {
 	["for"] = true,
 	["of"] = true,
 	["in"] = true,
+	["instanceof"] = true,
 	["break"] = true,
 	["continue"] = true,
 	["true"] = true,
@@ -30,6 +32,7 @@ local KEYWORDS = {
 	["null"] = true,
 	["undefined"] = true,
 	["typeof"] = true,
+	["void"] = true,
 	["this"] = true,
 	["new"] = true,
 	["switch"] = true,
@@ -40,6 +43,9 @@ local KEYWORDS = {
 	["catch"] = true,
 	["finally"] = true,
 	["class"] = true,
+	["extends"] = true,
+	["super"] = true,
+	["static"] = true,
 	["do"] = true,
 	["delete"] = true,
 }
@@ -48,6 +54,11 @@ local KEYWORDS = {
 local OPERATORS = {
 	"===",
 	"!==",
+	"**=",
+	"??=",
+	"...",
+	"?.",
+	"??",
 	"=>",
 	"==",
 	"!=",
@@ -61,7 +72,7 @@ local OPERATORS = {
 	"-=",
 	"*=",
 	"/=",
-	"...",
+	"**",
 	"+",
 	"-",
 	"*",
@@ -312,34 +323,114 @@ function Parser:block()
 	return { kind = "block", statements = statements }
 end
 
+-- A binding pattern: identifier, array/object destructuring, rest element.
+function Parser:pattern()
+	if self:at("punc", "[") then
+		self:next()
+		local elements = {}
+		while not self:at("punc", "]") do
+			if self:match("punc", ",") then
+				elements[#elements + 1] = false
+			else
+				local rest = self:match("punc", "...") ~= nil
+				local element = self:pattern()
+				local default
+				if not rest and self:match("punc", "=") then
+					default = self:expression(1)
+				end
+				elements[#elements + 1] = { pattern = element, default = default, rest = rest }
+				if rest or not self:match("punc", ",") then
+					break
+				end
+			end
+		end
+		self:expect("punc", "]")
+		return { kind = "arrayPattern", elements = elements }
+	elseif self:at("punc", "{") then
+		self:next()
+		local props = {}
+		while not self:at("punc", "}") do
+			local prop = {}
+			if self:match("punc", "...") then
+				prop.rest = true
+				prop.value = self:pattern()
+			else
+				local key
+				if self:at("ident") or self:at("string") or self:at("number") then
+					key = tostring(self:next().value)
+				elseif self:at("punc", "[") then
+					self:next()
+					key = self:expression(0)
+					self:expect("punc", "]")
+					prop.computed = true
+				else
+					self:errorAt(self:peek(), "invalid destructuring key")
+				end
+				prop.key = key
+				if self:match("punc", ":") then
+					prop.value = self:pattern()
+				else
+					prop.value = { kind = "identPattern", name = key }
+				end
+				if self:match("punc", "=") then
+					prop.default = self:expression(1)
+				end
+			end
+			props[#props + 1] = prop
+			if not self:match("punc", ",") then
+				break
+			end
+		end
+		self:expect("punc", "}")
+		return { kind = "objectPattern", props = props }
+	end
+	local token = self:peek()
+	if token.type ~= "ident" then
+		self:errorAt(token, "expected a binding name")
+	end
+	self:next()
+	return { kind = "identPattern", name = token.value }
+end
+
+function Parser:paramList()
+	self:expect("punc", "(")
+	local params = {}
+	while not self:at("punc", ")") do
+		local rest = self:match("punc", "...") ~= nil
+		local pattern = self:pattern()
+		local default
+		if not rest and self:match("punc", "=") then
+			default = self:expression(1)
+		end
+		params[#params + 1] = { pattern = pattern, default = default, rest = rest }
+		if rest or not self:match("punc", ",") then
+			break
+		end
+	end
+	self:expect("punc", ")")
+	return params
+end
+
+function Parser:functionRest()
+	local params = self:paramList()
+	return params, self:block()
+end
+
 function Parser:varDeclaration()
 	local kind = self:next().value
 	local declarations = {}
 	repeat
-		local name = self:expect("ident").value
+		local pattern = self:pattern()
 		local value
 		if self:match("punc", "=") then
 			value = self:expression(1)
 		end
-		declarations[#declarations + 1] = { name = name, value = value, kind = kind }
+		declarations[#declarations + 1] = { pattern = pattern, value = value, kind = kind }
 	until not self:match("punc", ",")
 	if self:at("punc", ";") then
 		self:next()
 	end
 	return { kind = "var", declarations = declarations }
-end
-
-function Parser:functionRest()
-	self:expect("punc", "(")
-	local params = {}
-	while not self:at("punc", ")") do
-		params[#params + 1] = self:expect("ident").value
-		if not self:match("punc", ",") then
-			break
-		end
-	end
-	self:expect("punc", ")")
-	return params, self:block()
 end
 
 function Parser:arrowBody()
@@ -354,21 +445,10 @@ function Parser:tryArrow()
 	if not self:at("punc", "(") then
 		return nil
 	end
-	self:next()
-	local params = {}
-	local ok = true
-	while not self:at("punc", ")") do
-		if self:at("ident") then
-			params[#params + 1] = self:next().value
-		else
-			ok = false
-			break
-		end
-		if not self:match("punc", ",") then
-			break
-		end
-	end
-	if ok and self:match("punc", ")") and self:at("punc", "=>") then
+	local ok, params = pcall(function()
+		return self:paramList()
+	end)
+	if ok and self:at("punc", "=>") then
 		self:next()
 		return { kind = "arrow", params = params, body = self:arrowBody() }
 	end
@@ -419,6 +499,87 @@ function Parser:templateParts(raw)
 	return parts
 end
 
+function Parser:objectLiteral()
+	self:expect("punc", "{")
+	local fields = {}
+	while not self:at("punc", "}") do
+		if self:match("punc", "...") then
+			fields[#fields + 1] = { spread = true, value = self:expression(1) }
+		else
+			local field = {}
+			if self:at("punc", "[") then
+				self:next()
+				field.key = self:expression(0)
+				field.computed = true
+				self:expect("punc", "]")
+			elseif self:at("ident") or self:at("string") or self:at("number") or self:at("keyword") then
+				field.key = tostring(self:next().value)
+			else
+				self:errorAt(self:peek(), "invalid object key")
+			end
+			if self:at("punc", "(") then
+				field.method = { params = self:paramList(), body = self:block() }
+			elseif self:match("punc", ":") then
+				field.value = self:expression(1)
+			else
+				field.value = { kind = "identifier", name = field.key }
+			end
+			fields[#fields + 1] = field
+		end
+		if not self:match("punc", ",") then
+			break
+		end
+	end
+	self:expect("punc", "}")
+	return { kind = "object", fields = fields }
+end
+
+function Parser:classRest(name)
+	local superClass
+	if self:match("keyword", "extends") then
+		superClass = self:postfix()
+	end
+	self:expect("punc", "{")
+	local members = {}
+	while not self:at("punc", "}") do
+		if self:match("punc", ";") then
+			-- empty member
+		else
+			local static = self:match("keyword", "static") ~= nil
+			local member = { static = static }
+			if self:at("punc", "[") then
+				self:next()
+				member.key = self:expression(0)
+				member.computed = true
+				self:expect("punc", "]")
+			elseif self:at("ident") or self:at("string") or self:at("number") or self:at("keyword") then
+				member.key = tostring(self:next().value)
+			else
+				self:errorAt(self:peek(), "invalid class member")
+			end
+			if self:at("punc", "(") then
+				member.kind = "method"
+				member.params = self:paramList()
+				member.body = self:block()
+				if member.key == "constructor" and not static then
+					member.constructor = true
+				end
+			else
+				member.kind = "field"
+				if self:match("punc", "=") then
+					member.value = self:expression(1)
+				end
+				if self:at("punc", ";") then
+					self:next()
+				end
+			end
+			members[#members + 1] = member
+		end
+	end
+	self:expect("punc", "}")
+	return { superClass = superClass, members = members, name = name }
+end
+
 function Parser:primary()
 	local token = self:peek()
 
@@ -430,6 +591,14 @@ function Parser:primary()
 		return { kind = "template", parts = self:templateParts(token.value) }
 	elseif token.type == "keyword" then
 		local value = token.value
+		if value == "new" then
+			self:next()
+			local target = self:postfix()
+			if target.kind == "call" then
+				return { kind = "new", ctor = target.callee, args = target.args }
+			end
+			return { kind = "new", ctor = target, args = {} }
+		end
 		self:next()
 		if value == "true" then
 			return { kind = "literal", value = true }
@@ -438,7 +607,25 @@ function Parser:primary()
 		elseif value == "null" or value == "undefined" then
 			return { kind = "literal", value = nil }
 		elseif value == "this" then
-			return { kind = "literal", value = nil }
+			return { kind = "this" }
+		elseif value == "super" then
+			if self:at("punc", "(") then
+				self:next()
+				local args = {}
+				while not self:at("punc", ")") do
+					if self:match("punc", "...") then
+						args[#args + 1] = { kind = "spread", value = self:expression(1) }
+					else
+						args[#args + 1] = self:expression(1)
+					end
+					if not self:match("punc", ",") then
+						break
+					end
+				end
+				self:expect("punc", ")")
+				return { kind = "superCall", args = args }
+			end
+			return { kind = "super" }
 		elseif value == "function" then
 			local name
 			if self:at("ident") then
@@ -446,8 +633,14 @@ function Parser:primary()
 			end
 			local params, body = self:functionRest()
 			return { kind = "function", name = name, params = params, body = body }
-		elseif value == "new" then
-			self:errorAt(token, "'new' is not supported")
+		elseif value == "class" then
+			local name
+			if self:at("ident") then
+				name = self:next().value
+			end
+			local info = self:classRest(name)
+			info.kind = "classExpr"
+			return info
 		else
 			self:errorAt(token, "unexpected keyword '" .. value .. "'")
 		end
@@ -455,7 +648,11 @@ function Parser:primary()
 		self:next()
 		if self:at("punc", "=>") then
 			self:next()
-			return { kind = "arrow", params = { token.value }, body = self:arrowBody() }
+			return {
+				kind = "arrow",
+				params = { { pattern = { kind = "identPattern", name = token.value } } },
+				body = self:arrowBody(),
+			}
 		end
 		return { kind = "identifier", name = token.value }
 	elseif token.type == "punc" and token.value == "(" then
@@ -473,6 +670,11 @@ function Parser:primary()
 		while not self:at("punc", "]") do
 			if self:match("punc", ",") then
 				elements[#elements + 1] = { kind = "literal", value = nil }
+			elseif self:match("punc", "...") then
+				elements[#elements + 1] = { kind = "spread", value = self:expression(1) }
+				if not self:match("punc", ",") then
+					break
+				end
 			else
 				elements[#elements + 1] = self:expression(1)
 				if not self:match("punc", ",") then
@@ -483,31 +685,27 @@ function Parser:primary()
 		self:expect("punc", "]")
 		return { kind = "array", elements = elements }
 	elseif token.type == "punc" and token.value == "{" then
-		self:next()
-		local fields = {}
-		while not self:at("punc", "}") do
-			local key
-			if self:at("ident") or self:at("string") or self:at("number") then
-				key = tostring(self:next().value)
-			else
-				self:errorAt(self:peek(), "invalid object key")
-			end
-			local value
-			if self:match("punc", ":") then
-				value = self:expression(1)
-			else
-				value = { kind = "identifier", name = key }
-			end
-			fields[#fields + 1] = { key = key, value = value }
-			if not self:match("punc", ",") then
-				break
-			end
-		end
-		self:expect("punc", "}")
-		return { kind = "object", fields = fields }
+		return self:objectLiteral()
 	end
 
 	self:errorAt(token, "unexpected token '" .. tostring(token.value) .. "'")
+end
+
+function Parser:arguments()
+	self:expect("punc", "(")
+	local args = {}
+	while not self:at("punc", ")") do
+		if self:match("punc", "...") then
+			args[#args + 1] = { kind = "spread", value = self:expression(1) }
+		else
+			args[#args + 1] = self:expression(1)
+		end
+		if not self:match("punc", ",") then
+			break
+		end
+	end
+	self:expect("punc", ")")
+	return args
 end
 
 function Parser:postfix()
@@ -518,22 +716,26 @@ function Parser:postfix()
 			self:next()
 			local name = self:expect("ident").value
 			node = { kind = "member", object = node, property = { kind = "literal", value = name } }
+		elseif token.type == "punc" and token.value == "?." then
+			self:next()
+			if token and self:at("punc", "(") then
+				node = { kind = "call", callee = node, args = self:arguments(), optional = true }
+			elseif self:at("punc", "[") then
+				self:next()
+				local property = self:expression(0)
+				self:expect("punc", "]")
+				node = { kind = "member", object = node, property = property, optional = true }
+			else
+				local name = self:expect("ident").value
+				node = { kind = "member", object = node, property = { kind = "literal", value = name }, optional = true }
+			end
 		elseif token.type == "punc" and token.value == "[" then
 			self:next()
 			local property = self:expression(0)
 			self:expect("punc", "]")
 			node = { kind = "member", object = node, property = property }
 		elseif token.type == "punc" and token.value == "(" then
-			self:next()
-			local args = {}
-			while not self:at("punc", ")") do
-				args[#args + 1] = self:expression(1)
-				if not self:match("punc", ",") then
-					break
-				end
-			end
-			self:expect("punc", ")")
-			node = { kind = "call", callee = node, args = args }
+			node = { kind = "call", callee = node, args = self:arguments() }
 		elseif token.type == "punc" and (token.value == "++" or token.value == "--") then
 			self:next()
 			node = { kind = "update", op = token.value, target = node, prefix = false }
@@ -552,9 +754,9 @@ function Parser:unary()
 	elseif token.type == "punc" and (token.value == "++" or token.value == "--") then
 		self:next()
 		return { kind = "update", op = token.value, target = self:unary(), prefix = true }
-	elseif token.type == "keyword" and token.value == "typeof" then
+	elseif token.type == "keyword" and (token.value == "typeof" or token.value == "delete" or token.value == "void") then
 		self:next()
-		return { kind = "unary", op = "typeof", value = self:unary() }
+		return { kind = "unary", op = token.value, value = self:unary() }
 	end
 	return self:postfix()
 end
@@ -565,6 +767,9 @@ local PRECEDENCE = {
 	["-="] = 1,
 	["*="] = 1,
 	["/="] = 1,
+	["**="] = 1,
+	["??="] = 1,
+	["??"] = 2,
 	["||"] = 3,
 	["&&"] = 4,
 	["=="] = 5,
@@ -575,18 +780,22 @@ local PRECEDENCE = {
 	[">"] = 6,
 	["<="] = 6,
 	[">="] = 6,
+	["in"] = 6,
+	["instanceof"] = 6,
 	["+"] = 7,
 	["-"] = 7,
 	["*"] = 8,
 	["/"] = 8,
 	["%"] = 8,
+	["**"] = 9,
 }
 
 function Parser:expression(minimum)
 	local left = self:unary()
 	while true do
 		local token = self:peek()
-		if token.type == "punc" and token.value == "?" then
+		local isOperator = token.type == "punc" or token.type == "keyword"
+		if isOperator and token.value == "?" then
 			if (minimum or 0) >= 2 then
 				break
 			end
@@ -595,7 +804,7 @@ function Parser:expression(minimum)
 			self:expect("punc", ":")
 			local no = self:expression(2)
 			left = { kind = "conditional", test = left, yes = yes, no = no }
-		elseif token.type == "punc" and PRECEDENCE[token.value] then
+		elseif isOperator and PRECEDENCE[token.value] then
 			local precedence = PRECEDENCE[token.value]
 			if precedence <= (minimum or 0) then
 				break
@@ -605,6 +814,9 @@ function Parser:expression(minimum)
 			if precedence == 1 then
 				right = self:expression(precedence - 1)
 				left = { kind = "assign", op = token.value, target = left, value = right }
+			elseif precedence == 9 then
+				right = self:expression(precedence - 1)
+				left = { kind = "binary", op = token.value, left = left, right = right }
 			else
 				right = self:expression(precedence)
 				left = { kind = "binary", op = token.value, left = left, right = right }
@@ -643,17 +855,17 @@ function Parser:forStatement()
 	self:expect("punc", "(")
 	if self:at("keyword", "let") or self:at("keyword", "const") or self:at("keyword", "var") then
 		self:next()
-		local name = self:expect("ident").value
-		if self:at("ident", "of") or self:at("keyword", "of") then
+		local pattern = self:pattern()
+		if self:at("keyword", "of") then
 			self:next()
 			local iterable = self:expression(0)
 			self:expect("punc", ")")
-			return { kind = "forOf", name = name, iterable = iterable, body = self:statement() }
-		elseif self:at("ident", "in") or self:at("keyword", "in") then
+			return { kind = "forOf", pattern = pattern, iterable = iterable, body = self:statement() }
+		elseif self:at("keyword", "in") then
 			self:next()
 			local iterable = self:expression(0)
 			self:expect("punc", ")")
-			return { kind = "forIn", name = name, iterable = iterable, body = self:statement() }
+			return { kind = "forIn", pattern = pattern, iterable = iterable, body = self:statement() }
 		end
 		self:expect("punc", "=")
 		local init = self:expression(1)
@@ -670,7 +882,7 @@ function Parser:forStatement()
 		self:expect("punc", ")")
 		return {
 			kind = "for",
-			name = name,
+			pattern = pattern,
 			init = init,
 			test = test,
 			update = update,
@@ -678,6 +890,57 @@ function Parser:forStatement()
 		}
 	end
 	self:errorAt(token, "for loops need 'let name = value; ...'")
+end
+
+function Parser:switchStatement()
+	self:next()
+	self:expect("punc", "(")
+	local discriminant = self:expression(0)
+	self:expect("punc", ")")
+	self:expect("punc", "{")
+	local cases = {}
+	while not self:at("punc", "}") do
+		local test
+		if self:match("keyword", "case") then
+			test = self:expression(0)
+			self:expect("punc", ":")
+		elseif self:match("keyword", "default") then
+			self:expect("punc", ":")
+		else
+			self:errorAt(self:peek(), "expected case or default")
+		end
+		local statements = {}
+		while not self:at("keyword", "case") and not self:at("keyword", "default") and not self:at("punc", "}") do
+			if self:at("eof") then
+				self:errorAt(self:peek(), "unclosed switch")
+			end
+			statements[#statements + 1] = self:statement()
+		end
+		cases[#cases + 1] = { test = test, statements = statements }
+	end
+	self:expect("punc", "}")
+	return { kind = "switch", discriminant = discriminant, cases = cases }
+end
+
+function Parser:tryStatement()
+	self:next()
+	local block = self:block()
+	local catch, finally
+	if self:match("keyword", "catch") then
+		local pattern
+		if self:match("punc", "(") then
+			pattern = self:pattern()
+			self:expect("punc", ")")
+		end
+		catch = { pattern = pattern, block = self:block() }
+	end
+	if self:match("keyword", "finally") then
+		finally = self:block()
+	end
+	if not catch and not finally then
+		self:errorAt(self:peek(), "try needs catch or finally")
+	end
+	return { kind = "try", block = block, catch = catch, finally = finally }
 end
 
 function Parser:statement()
@@ -696,12 +959,40 @@ function Parser:statement()
 			local name = self:expect("ident").value
 			local params, body = self:functionRest()
 			return { kind = "function", name = name, params = params, body = body }
+		elseif value == "class" then
+			self:next()
+			local name = self:expect("ident").value
+			local info = self:classRest(name)
+			info.kind = "classDecl"
+			return info
 		elseif value == "if" then
 			return self:ifStatement()
 		elseif value == "while" then
 			return self:whileStatement()
 		elseif value == "for" then
 			return self:forStatement()
+		elseif value == "switch" then
+			return self:switchStatement()
+		elseif value == "try" then
+			return self:tryStatement()
+		elseif value == "do" then
+			self:next()
+			local body = self:statement()
+			self:expect("keyword", "while")
+			self:expect("punc", "(")
+			local test = self:expression(0)
+			self:expect("punc", ")")
+			if self:at("punc", ";") then
+				self:next()
+			end
+			return { kind = "doWhile", test = test, body = body }
+		elseif value == "throw" then
+			self:next()
+			local expression = self:expression(0)
+			if self:at("punc", ";") then
+				self:next()
+			end
+			return { kind = "throw", value = expression }
 		elseif value == "return" then
 			self:next()
 			local expression
@@ -724,8 +1015,6 @@ function Parser:statement()
 				self:next()
 			end
 			return { kind = "continue" }
-		elseif value == "switch" or value == "try" or value == "class" or value == "do" or value == "throw" or value == "delete" then
-			self:errorAt(token, "'" .. value .. "' is not supported")
 		end
 	end
 
@@ -736,9 +1025,10 @@ function Parser:statement()
 	return { kind = "expression", expression = expression }
 end
 
--- Values and environments -----------------------------------------------
+-- Values and environments ---------------------------------------------
 
 local NIL = { __nil = true }
+local THIS = { __this = true }
 
 local function truthy(value)
 	if value == nil or value == NIL then
@@ -762,17 +1052,35 @@ local function toNumber(value)
 end
 
 local function typeOf(value)
-	if value == nil then
+	if value == nil or value == NIL then
 		return "undefined"
 	end
 	local valueType = type(value)
 	if valueType == "table" then
-		if isArray(value) then
-			return "object"
+		if isArray(value) or (type(value.__jsClass) == "boolean") then
+			return value.__jsClass and "function" or "object"
 		end
-		return value.__jsFunction and "function" or "object"
+		return "object"
 	end
 	return valueType
+end
+
+local function toJsString(value)
+	if value == nil or value == NIL then
+		return "undefined"
+	elseif type(value) == "string" then
+		return value
+	elseif type(value) == "table" then
+		if isArray(value) then
+			local parts = {}
+			for index = 1, #value do
+				parts[#parts + 1] = toJsString(value[index])
+			end
+			return table.concat(parts, ",")
+		end
+		return "[object Object]"
+	end
+	return tostring(value)
 end
 
 local Env = {}
@@ -824,16 +1132,76 @@ local function pack(...)
 	return table.pack(...)
 end
 
-local function callFunction(fn, args)
-	if type(fn) ~= "function" then
+-- Interpreter functions are plain Lua functions (so the host can call them as
+-- event handlers) with metadata kept out of band.
+local functionInfo = setmetatable({}, { __mode = "k" })
+
+local evalExpression
+local execStatement
+local execBlock
+local makeFunction
+local bindPattern
+local evaluateClass
+
+local function callFunction(fn, args, thisValue)
+	local fnType = type(fn)
+	if fnType == "table" and fn.__jsClass then
+		fn = fn.constructor
+		fnType = type(fn)
+	end
+	if fnType ~= "function" then
 		error("TypeError: " .. typeOf(fn) .. " is not a function", 0)
 	end
+	if functionInfo[fn] then
+		-- Interpreter functions receive (args..., THIS, thisValue) so `this` is
+		-- bound without changing the callable's Lua signature.
+		local count = args.n or #args
+		local values = { n = count + 2 }
+		for index = 1, count do
+			values[index] = args[index]
+		end
+		values[count + 1] = THIS
+		values[count + 2] = thisValue
+		return fn(table.unpack(values, 1, count + 2))
+	end
 	return fn(table.unpack(args, 1, args.n or #args))
+end
+
+local function spreadArgs(nodes, env, context)
+	local args = { n = 0 }
+	for _, node in nodes do
+		if node.kind == "spread" then
+			local value = evalExpression(node.value, env, context)
+			if isArray(value) then
+				for index = 1, #value do
+					args.n += 1
+					args[args.n] = value[index]
+				end
+			elseif type(value) == "string" then
+				for index = 1, #value do
+					args.n += 1
+					args[args.n] = value:sub(index, index)
+				end
+			elseif type(value) == "table" then
+				for _, item in value do
+					args.n += 1
+					args[args.n] = item
+				end
+			end
+		else
+			args.n += 1
+			args[args.n] = evalExpression(node, env, context)
+		end
+	end
+	return args
 end
 
 local function arrayMember(array, key)
 	if type(key) == "number" then
 		return array[key + 1]
+	end
+	if type(key) == "string" and tonumber(key) then
+		return array[tonumber(key) + 1]
 	end
 	if key == "length" then
 		return #array
@@ -885,9 +1253,9 @@ local function arrayMember(array, key)
 			end
 			local parts = {}
 			for _, item in array do
-				parts[#parts + 1] = item == nil and "" or tostring(item)
+				parts[#parts + 1] = item == nil and "" or toJsString(item)
 			end
-			return table.concat(parts, tostring(separator))
+			return table.concat(parts, toJsString(separator))
 		end
 	elseif key == "forEach" then
 		return function(fn)
@@ -922,6 +1290,15 @@ local function arrayMember(array, key)
 			end
 			return nil
 		end
+	elseif key == "findIndex" then
+		return function(fn)
+			for index, item in array do
+				if truthy(callFunction(fn, pack(item, index - 1))) then
+					return index - 1
+				end
+			end
+			return -1
+		end
 	elseif key == "some" then
 		return function(fn)
 			for index, item in array do
@@ -940,6 +1317,19 @@ local function arrayMember(array, key)
 			end
 			return true
 		end
+	elseif key == "reduce" then
+		return function(fn, initial)
+			local accumulator = initial
+			local start = 1
+			if accumulator == nil then
+				accumulator = array[1]
+				start = 2
+			end
+			for index = start, #array do
+				accumulator = callFunction(fn, pack(accumulator, array[index], index - 1))
+			end
+			return accumulator
+		end
 	elseif key == "slice" then
 		return function(first, last)
 			local length = #array
@@ -956,6 +1346,23 @@ local function arrayMember(array, key)
 				out[#out + 1] = array[index]
 			end
 			return out
+		end
+	elseif key == "splice" then
+		return function(start, deleteCount, ...)
+			start = math.floor(toNumber(start or 0))
+			if start < 0 then
+				start = math.max(0, #array + start)
+			end
+			start += 1
+			deleteCount = deleteCount == nil and (#array - start + 1) or math.floor(toNumber(deleteCount))
+			local removed = Js.array({})
+			for _ = 1, math.min(deleteCount, #array - start + 1) do
+				removed[#removed + 1] = table.remove(array, start)
+			end
+			for index = 1, select("#", ...) do
+				table.insert(array, start + index - 1, select(index, ...))
+			end
+			return removed
 		end
 	elseif key == "concat" then
 		return function(other)
@@ -980,6 +1387,43 @@ local function arrayMember(array, key)
 			end
 			return array
 		end
+	elseif key == "sort" then
+		return function(comparator)
+			if type(comparator) == "function" then
+				table.sort(array, function(a, b)
+					return toNumber(callFunction(comparator, pack(a, b))) < 0
+				end)
+			else
+				table.sort(array, function(a, b)
+					return toJsString(a) < toJsString(b)
+				end)
+			end
+			return array
+		end
+	elseif key == "flat" then
+		return function(depth)
+			depth = depth == nil and 1 or math.floor(toNumber(depth))
+			local out = Js.array({})
+			local function add(list, level)
+				for _, item in list do
+					if isArray(item) and level > 0 then
+						add(item, level - 1)
+					else
+						out[#out + 1] = item
+					end
+				end
+			end
+			add(array, depth)
+			return out
+		end
+	elseif key == "at" then
+		return function(index)
+			index = math.floor(toNumber(index))
+			if index < 0 then
+				index = #array + index
+			end
+			return array[index + 1]
+		end
 	end
 	return nil
 end
@@ -997,7 +1441,15 @@ local function stringMember(value, key)
 		end
 	elseif key == "trim" then
 		return function()
-			return value:gsub("^%s+", ""):gsub("%s+$", "")
+			return (value:gsub("^%s+", ""):gsub("%s+$", ""))
+		end
+	elseif key == "trimStart" then
+		return function()
+			return (value:gsub("^%s+", ""))
+		end
+	elseif key == "trimEnd" then
+		return function()
+			return (value:gsub("%s+$", ""))
 		end
 	elseif key == "includes" then
 		return function(needle)
@@ -1022,6 +1474,11 @@ local function stringMember(value, key)
 		return function(index)
 			index = math.floor(toNumber(index)) + 1
 			return value:sub(index, index)
+		end
+	elseif key == "charCodeAt" then
+		return function(index)
+			local char = value:sub(math.floor(toNumber(index)) + 1, math.floor(toNumber(index)) + 1)
+			return char == "" and 0 or utf8.codepoint(char)
 		end
 	elseif key == "substring" then
 		return function(first, last)
@@ -1071,19 +1528,63 @@ local function stringMember(value, key)
 			end
 			return out
 		end
-	elseif key == "replace" then
+	elseif key == "replace" or key == "replaceAll" then
 		return function(needle, replacement)
 			needle = tostring(needle)
-			replacement = tostring(replacement)
+			local count = key == "replace" and 1 or nil
+			local function substitute(found)
+				if type(replacement) == "function" then
+					return toJsString(callFunction(replacement, pack(found)))
+				end
+				return tostring(replacement)
+			end
 			local start = value:find(needle, 1, true)
 			if not start then
 				return value
 			end
-			return value:sub(1, start - 1) .. replacement .. value:sub(start + #needle)
+			return (value:gsub(needle:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1"), function(found)
+				if count and count <= 0 then
+					return found
+				end
+				if count then
+					count -= 1
+				end
+				return substitute(found)
+			end))
 		end
 	elseif key == "repeat" then
 		return function(count)
 			return value:rep(math.max(0, math.floor(toNumber(count))))
+		end
+	elseif key == "padStart" then
+		return function(length, padding)
+			length = math.floor(toNumber(length))
+			padding = padding == nil and " " or tostring(padding)
+			local missing = length - #value
+			if missing <= 0 then
+				return value
+			end
+			local fill = padding:rep(math.ceil(missing / #padding)):sub(1, missing)
+			return fill .. value
+		end
+	elseif key == "padEnd" then
+		return function(length, padding)
+			length = math.floor(toNumber(length))
+			padding = padding == nil and " " or tostring(padding)
+			local missing = length - #value
+			if missing <= 0 then
+				return value
+			end
+			local fill = padding:rep(math.ceil(missing / #padding)):sub(1, missing)
+			return value .. fill
+		end
+	elseif key == "concat" then
+		return function(...)
+			local out = { value }
+			for index = 1, select("#", ...) do
+				out[#out + 1] = toJsString(select(index, ...))
+			end
+			return table.concat(out)
 		end
 	elseif key == "toString" then
 		return function()
@@ -1097,6 +1598,10 @@ local function numberMember(value, key)
 	if key == "toFixed" then
 		return function(digits)
 			return string.format("%." .. math.floor(toNumber(digits)) .. "f", value)
+		end
+	elseif key == "toPrecision" then
+		return function(digits)
+			return string.format("%." .. math.max(0, math.floor(toNumber(digits)) - 1) .. "g", value)
 		end
 	elseif key == "toString" then
 		return function()
@@ -1116,7 +1621,16 @@ local function getMember(object, key)
 		return numberMember(object, key)
 	elseif type(object) == "table" then
 		if isArray(object) then
-			return arrayMember(object, key)
+			local member = arrayMember(object, key)
+			if member ~= nil then
+				return member
+			end
+		elseif object.__jsClass then
+			local static = object[key]
+			if static ~= nil then
+				return static
+			end
+			return object.prototype[key]
 		end
 		return object[key]
 	end
@@ -1135,16 +1649,34 @@ local function setMember(object, key, value)
 	return value
 end
 
+local function instanceOf(object, class)
+	if type(object) ~= "table" or type(class) ~= "table" or not class.__jsClass then
+		return false
+	end
+	local metatable = getmetatable(object)
+	local current = metatable and metatable.__index
+	while type(current) == "table" do
+		if current == class.prototype then
+			return true
+		end
+		local parent = getmetatable(current)
+		current = parent and parent.__index
+	end
+	return false
+end
+
 local function evaluateBinary(op, a, b)
 	if op == "+" then
-		if type(a) == "string" or type(b) == "string" then
-			return tostring(a == nil and "undefined" or a) .. tostring(b == nil and "undefined" or b)
+		if type(a) == "string" or type(b) == "string" or type(a) == "table" or type(b) == "table" then
+			return toJsString(a) .. toJsString(b)
 		end
 		return toNumber(a) + toNumber(b)
 	elseif op == "-" then
 		return toNumber(a) - toNumber(b)
 	elseif op == "*" then
 		return toNumber(a) * toNumber(b)
+	elseif op == "**" then
+		return toNumber(a) ^ toNumber(b)
 	elseif op == "/" then
 		local divisor = toNumber(b)
 		if divisor == 0 then
@@ -1169,22 +1701,22 @@ local function evaluateBinary(op, a, b)
 		return a <= b
 	elseif op == ">=" then
 		return a >= b
+	elseif op == "in" then
+		return type(b) == "table" and b[a] ~= nil or false
+	elseif op == "instanceof" then
+		return instanceOf(a, b)
 	end
 	error("JS error: unsupported operator " .. tostring(op), 0)
 end
-
--- Interpreter -----------------------------------------------------------
-
-local evalExpression
-local execStatement
-local execBlock
-local makeFunction
 
 local function readTarget(node, env, context)
 	if node.kind == "identifier" then
 		return env:get(node.name)
 	elseif node.kind == "member" then
 		local object = evalExpression(node.object, env, context)
+		if object == nil or object == NIL then
+			return nil
+		end
 		local key = evalExpression(node.property, env, context)
 		return getMember(object, key)
 	end
@@ -1202,26 +1734,180 @@ local function writeTarget(node, value, env, context)
 	error("JS syntax error: invalid assignment target", 0)
 end
 
-makeFunction = function(node, closure, context)
-	return function(...)
-		local args = pack(...)
-		local callEnv = Env.new(closure)
-		for index, param in node.params do
-			callEnv:declare(param, args[index])
+bindPattern = function(pattern, value, env, context, declare)
+	if pattern.kind == "identPattern" then
+		if declare then
+			env:declare(pattern.name, value)
+		else
+			env:set(pattern.name, value)
 		end
-		context.steps += 1
-		if context.steps > MAX_STEPS then
-			error("JS error: script exceeded the step limit", 0)
-		end
-		if node.body.kind == "block" then
-			local control = execBlock(node.body, callEnv, context)
-			if control and control.type == "return" then
-				return control.value
+	elseif pattern.kind == "arrayPattern" then
+		local items = {}
+		if isArray(value) or type(value) == "table" then
+			for index = 1, #value do
+				items[index] = value[index]
 			end
-			return nil
+		elseif type(value) == "string" then
+			for index = 1, #value do
+				items[index] = value:sub(index, index)
+			end
 		end
-		return evalExpression(node.body.expression, callEnv, context)
+		local index = 1
+		for _, entry in pattern.elements do
+			if entry == false then
+				index += 1
+			elseif entry.rest then
+				local rest = Js.array({})
+				for position = index, #items do
+					rest[#rest + 1] = items[position]
+				end
+				bindPattern(entry.pattern, rest, env, context, declare)
+				index = #items + 1
+			else
+				local item = items[index]
+				if item == nil and entry.default then
+					item = evalExpression(entry.default, env, context)
+				end
+				bindPattern(entry.pattern, item, env, context, declare)
+				index += 1
+			end
+		end
+	elseif pattern.kind == "objectPattern" then
+		local used = {}
+		for _, prop in pattern.props do
+			if prop.rest then
+				local rest = {}
+				if type(value) == "table" then
+					for key, item in value do
+						if not used[key] then
+							rest[key] = item
+						end
+					end
+				end
+				bindPattern(prop.value, rest, env, context, declare)
+			else
+				local key = prop.computed and evalExpression(prop.key, env, context) or prop.key
+				used[key] = true
+				local item
+				if type(value) == "table" then
+					item = value[key]
+				end
+				if item == nil and prop.default then
+					item = evalExpression(prop.default, env, context)
+				end
+				bindPattern(prop.value, item, env, context, declare)
+			end
+		end
 	end
+end
+
+local function bindParams(params, args, env, context)
+	local index = 1
+	for _, param in params do
+		if param.rest then
+			local rest = Js.array({})
+			for position = index, (args.n or #args) do
+				rest[#rest + 1] = args[position]
+			end
+			bindPattern(param.pattern, rest, env, context, true)
+			index = (args.n or #args) + 1
+		else
+			local value = args[index]
+			if value == nil and param.default then
+				value = evalExpression(param.default, env, context)
+			end
+			bindPattern(param.pattern, value, env, context, true)
+			index += 1
+		end
+	end
+end
+
+makeFunction = function(node, closure, context)
+	local isArrow = node.kind == "arrow"
+	local lexicalThis = context.currentThis
+	local fn
+	local info = { isArrow = isArrow }
+	fn = function(...)
+		local args = table.pack(...)
+		local thisValue
+		if args.n >= 2 and args[args.n - 1] == THIS then
+			thisValue = args[args.n]
+			args[args.n] = nil
+			args[args.n - 1] = nil
+			args.n -= 2
+		end
+		local savedThis = context.currentThis
+		context.currentThis = isArrow and lexicalThis or thisValue
+		local ok, result = pcall(function()
+			local callEnv = Env.new(closure)
+			callEnv:declare("arguments", args)
+			if node.name then
+				callEnv:declare(node.name, fn)
+			end
+			bindParams(node.params, args, callEnv, context)
+			context.steps += 1
+			if context.steps > MAX_STEPS then
+				error("JS error: script exceeded the step limit", 0)
+			end
+			if node.body.kind == "block" then
+				local control = execBlock(node.body, callEnv, context)
+				if control and control.type == "return" then
+					return control.value
+				end
+				return nil
+			end
+			return evalExpression(node.body.expression, callEnv, context)
+		end)
+		context.currentThis = savedThis
+		if not ok then
+			error(result, 0)
+		end
+		return result
+	end
+	functionInfo[fn] = info
+	return fn
+end
+
+evaluateClass = function(node, env, context)
+	local superClass
+	if node.superClass then
+		superClass = evalExpression(node.superClass, env, context)
+	end
+	local classEnv = Env.new(env)
+	if superClass then
+		classEnv:declare("super", superClass)
+	end
+	local classObject = { __jsClass = true, name = node.name, prototype = {} }
+	if type(superClass) == "table" and superClass.__jsClass then
+		setmetatable(classObject.prototype, { __index = superClass.prototype })
+		classObject.constructor = superClass.constructor
+	end
+	classObject.prototype.constructor = classObject
+	for _, member in node.members do
+		local key = member.computed and evalExpression(member.key, classEnv, context) or member.key
+		if member.kind == "method" then
+			local fn = makeFunction({ kind = "function", params = member.params, body = member.body }, classEnv, context)
+			if member.constructor then
+				classObject.constructor = fn
+			elseif member.static then
+				classObject[key] = fn
+			else
+				classObject.prototype[key] = fn
+			end
+		elseif member.kind == "field" then
+			local value = member.value and evalExpression(member.value, classEnv, context) or nil
+			if member.static then
+				classObject[key] = value
+			else
+				classObject.instanceFields = classObject.instanceFields or {}
+				classObject.instanceFields[#classObject.instanceFields + 1] = { key = key, value = value }
+			end
+		end
+	end
+	if not classObject.constructor then
+		classObject.constructor = makeFunction({ kind = "function", params = {}, body = { kind = "block", statements = {} } }, classEnv, context)
+	end
+	return classObject
 end
 
 evalExpression = function(node, env, context)
@@ -1230,53 +1916,142 @@ evalExpression = function(node, env, context)
 		return node.value
 	elseif kind == "identifier" then
 		return env:get(node.name)
+	elseif kind == "this" then
+		return context.currentThis
+	elseif kind == "super" then
+		return env:get("super")
 	elseif kind == "template" then
 		local parts = {}
 		for _, part in node.parts do
 			if part.text then
 				parts[#parts + 1] = part.text
 			else
-				local value = evalExpression(part.expression, env, context)
-				parts[#parts + 1] = value == nil and "undefined" or tostring(value)
+				parts[#parts + 1] = toJsString(evalExpression(part.expression, env, context))
 			end
 		end
 		return table.concat(parts)
 	elseif kind == "array" then
 		local out = Js.array({})
-		for index, element in node.elements do
-			out[index] = evalExpression(element, env, context)
+		for _, element in node.elements do
+			if element.kind == "spread" then
+				local value = evalExpression(element.value, env, context)
+				if isArray(value) then
+					for index = 1, #value do
+						out[#out + 1] = value[index]
+					end
+				elseif type(value) == "string" then
+					for index = 1, #value do
+						out[#out + 1] = value:sub(index, index)
+					end
+				end
+			else
+				out[#out + 1] = evalExpression(element, env, context)
+			end
 		end
 		return out
 	elseif kind == "object" then
 		local out = {}
 		for _, field in node.fields do
-			out[field.key] = evalExpression(field.value, env, context)
+			if field.spread then
+				local source = evalExpression(field.value, env, context)
+				if type(source) == "table" then
+					for key, item in source do
+						out[key] = item
+					end
+				end
+			else
+				local key = field.computed and evalExpression(field.key, env, context) or field.key
+				if field.method then
+					out[key] = makeFunction({ kind = "function", params = field.method.params, body = field.method.body }, env, context)
+				else
+					out[key] = evalExpression(field.value, env, context)
+				end
+			end
 		end
 		return out
 	elseif kind == "function" or kind == "arrow" then
 		return makeFunction(node, env, context)
+	elseif kind == "classExpr" then
+		local classObject = evaluateClass(node, env, context)
+		if node.name then
+			local classEnv = Env.new(env)
+			classEnv:declare(node.name, classObject)
+			return classObject
+		end
+		return classObject
 	elseif kind == "member" then
 		local object = evalExpression(node.object, env, context)
+		if object == nil or object == NIL then
+			if node.optional then
+				return NIL
+			end
+			if object == NIL then
+				return NIL
+			end
+			error("TypeError: cannot read property '" .. tostring(node.property.value) .. "' of undefined", 0)
+		end
 		local key = evalExpression(node.property, env, context)
 		return getMember(object, key)
 	elseif kind == "call" then
-		local fn
+		local fn, thisValue
 		if node.callee.kind == "member" then
 			local object = evalExpression(node.callee.object, env, context)
+			if object == nil or object == NIL then
+				if node.callee.optional then
+					return NIL
+				end
+				return NIL
+			end
 			local key = evalExpression(node.callee.property, env, context)
 			fn = getMember(object, key)
+			if node.callee.object.kind == "super" then
+				thisValue = context.currentThis
+			else
+				thisValue = object
+			end
 		else
 			fn = evalExpression(node.callee, env, context)
 		end
-		local args = { n = #node.args }
-		for index, argNode in node.args do
-			args[index] = evalExpression(argNode, env, context)
+		if fn == nil or fn == NIL then
+			if node.optional then
+				return NIL
+			end
+			error("TypeError: " .. typeOf(fn) .. " is not a function", 0)
 		end
-		return callFunction(fn, args)
+		return callFunction(fn, spreadArgs(node.args, env, context), thisValue)
+	elseif kind == "new" then
+		local classObject = evalExpression(node.ctor, env, context)
+		if type(classObject) ~= "table" or not classObject.__jsClass then
+			error("TypeError: " .. typeOf(classObject) .. " is not a constructor", 0)
+		end
+		local instance = setmetatable({}, { __index = classObject.prototype })
+		if classObject.instanceFields then
+			for _, field in classObject.instanceFields do
+				instance[field.key] = field.value
+			end
+		end
+		local result = callFunction(classObject.constructor, spreadArgs(node.args, env, context), instance)
+		if type(result) == "table" and result ~= NIL then
+			return result
+		end
+		return instance
+	elseif kind == "superCall" then
+		local superClass = env:get("super")
+		if type(superClass) ~= "table" then
+			error("TypeError: no parent class to call super on", 0)
+		end
+		return callFunction(superClass.constructor, spreadArgs(node.args, env, context), context.currentThis)
 	elseif kind == "assign" then
 		local value
 		if node.op == "=" then
 			value = evalExpression(node.value, env, context)
+		elseif node.op == "??=" then
+			local current = readTarget(node.target, env, context)
+			if current == nil or current == NIL then
+				value = evalExpression(node.value, env, context)
+			else
+				value = current
+			end
 		else
 			local current = readTarget(node.target, env, context)
 			local right = evalExpression(node.value, env, context)
@@ -1298,6 +2073,23 @@ evalExpression = function(node, env, context)
 			return toNumber(evalExpression(node.value, env, context))
 		elseif node.op == "typeof" then
 			return typeOf(evalExpression(node.value, env, context))
+		elseif node.op == "void" then
+			evalExpression(node.value, env, context)
+			return nil
+		elseif node.op == "delete" then
+			local target = node.value
+			if target.kind == "member" then
+				local object = evalExpression(target.object, env, context)
+				local key = evalExpression(target.property, env, context)
+				if type(object) == "table" then
+					if isArray(object) and type(key) == "number" then
+						object[key + 1] = nil
+					else
+						object[key] = nil
+					end
+				end
+			end
+			return true
 		end
 	elseif kind == "binary" then
 		if node.op == "&&" then
@@ -1312,6 +2104,12 @@ evalExpression = function(node, env, context)
 				return left
 			end
 			return evalExpression(node.right, env, context)
+		elseif node.op == "??" then
+			local left = evalExpression(node.left, env, context)
+			if left == nil or left == NIL then
+				return evalExpression(node.right, env, context)
+			end
+			return left
 		end
 		return evaluateBinary(node.op, evalExpression(node.left, env, context), evalExpression(node.right, env, context))
 	elseif kind == "conditional" then
@@ -1331,6 +2129,13 @@ execBlock = function(block, env, context)
 		end
 	end
 	return nil
+end
+
+local function unwrapThrow(value)
+	if type(value) == "table" and value.__jsThrow then
+		return value.value
+	end
+	return tostring(value)
 end
 
 execStatement = function(node, env, context)
@@ -1353,11 +2158,14 @@ execStatement = function(node, env, context)
 			if declaration.value then
 				value = evalExpression(declaration.value, env, context)
 			end
-			env:declare(declaration.name, value)
+			bindPattern(declaration.pattern, value, env, context, true)
 		end
 		return nil
 	elseif kind == "function" then
 		env:declare(node.name, makeFunction(node, env, context))
+		return nil
+	elseif kind == "classDecl" then
+		env:declare(node.name, evaluateClass(node, env, context))
 		return nil
 	elseif kind == "if" then
 		if truthy(evalExpression(node.test, env, context)) then
@@ -1378,9 +2186,21 @@ execStatement = function(node, env, context)
 			end
 		end
 		return nil
+	elseif kind == "doWhile" then
+		repeat
+			local control = execStatement(node.body, env, context)
+			if control then
+				if control.type == "break" then
+					break
+				elseif control.type == "return" then
+					return control
+				end
+			end
+		until not truthy(evalExpression(node.test, env, context))
+		return nil
 	elseif kind == "for" then
 		local loopEnv = Env.new(env)
-		loopEnv:declare(node.name, evalExpression(node.init, env, context))
+		bindPattern(node.pattern, evalExpression(node.init, env, context), loopEnv, context, true)
 		while true do
 			if node.test and not truthy(evalExpression(node.test, loopEnv, context)) then
 				break
@@ -1400,7 +2220,6 @@ execStatement = function(node, env, context)
 		return nil
 	elseif kind == "forOf" then
 		local iterable = evalExpression(node.iterable, env, context)
-		local loopEnv = Env.new(env)
 		local values = {}
 		if isArray(iterable) then
 			for index = 1, #iterable do
@@ -1420,7 +2239,7 @@ execStatement = function(node, env, context)
 		for _, value in values do
 			-- A fresh binding per iteration: closures keep the value they saw.
 			local iterationEnv = Env.new(env)
-			iterationEnv:declare(node.name, value)
+			bindPattern(node.pattern, value, iterationEnv, context, true)
 			local control = execStatement(node.body, iterationEnv, context)
 			if control then
 				if control.type == "break" then
@@ -1433,7 +2252,6 @@ execStatement = function(node, env, context)
 		return nil
 	elseif kind == "forIn" then
 		local iterable = evalExpression(node.iterable, env, context)
-		local loopEnv = Env.new(env)
 		local keys = {}
 		if type(iterable) == "table" then
 			for key in iterable do
@@ -1442,7 +2260,7 @@ execStatement = function(node, env, context)
 		end
 		for _, key in keys do
 			local iterationEnv = Env.new(env)
-			iterationEnv:declare(node.name, key)
+			bindPattern(node.pattern, key, iterationEnv, context, true)
 			local control = execStatement(node.body, iterationEnv, context)
 			if control then
 				if control.type == "break" then
@@ -1453,6 +2271,60 @@ execStatement = function(node, env, context)
 			end
 		end
 		return nil
+	elseif kind == "switch" then
+		local discriminant = evalExpression(node.discriminant, env, context)
+		local startIndex
+		local defaultIndex
+		for index, case in node.cases do
+			if case.test then
+				if evaluateBinary("===", discriminant, evalExpression(case.test, env, context)) then
+					startIndex = index
+					break
+				end
+			else
+				defaultIndex = defaultIndex or index
+			end
+		end
+		startIndex = startIndex or defaultIndex
+		if startIndex then
+			local switchEnv = Env.new(env)
+			for index = startIndex, #node.cases do
+				local control = execBlock({ kind = "block", statements = node.cases[index].statements }, switchEnv, context)
+				if control then
+					if control.type == "break" then
+						return nil
+					end
+					return control
+				end
+			end
+		end
+		return nil
+	elseif kind == "try" then
+		local ok, result = pcall(execBlock, node.block, Env.new(env), context)
+		local control
+		if ok then
+			control = result
+		elseif node.catch then
+			local catchEnv = Env.new(env)
+			if node.catch.pattern then
+				bindPattern(node.catch.pattern, unwrapThrow(result), catchEnv, context, true)
+			end
+			control = execBlock(node.catch.block, catchEnv, context)
+		else
+			if node.finally then
+				execBlock(node.finally, Env.new(env), context)
+			end
+			error(result, 0)
+		end
+		if node.finally then
+			local finallyControl = execBlock(node.finally, Env.new(env), context)
+			if finallyControl then
+				control = finallyControl
+			end
+		end
+		return control
+	elseif kind == "throw" then
+		error({ __jsThrow = true, value = evalExpression(node.value, env, context) }, 0)
 	elseif kind == "return" then
 		return { type = "return", value = node.value and evalExpression(node.value, env, context) or nil }
 	elseif kind == "break" then
@@ -1471,11 +2343,11 @@ function Js.run(source, host)
 		local parser = newParser(tokens)
 		local program = parser:program()
 		local env = Env.new(nil, host)
-		local context = { steps = 0 }
+		local context = { steps = 0, currentThis = nil }
 		execBlock({ kind = "block", statements = program }, env, context)
 	end)
 	if not ok then
-		return false, tostring(result)
+		return false, tostring(unwrapThrow(result))
 	end
 	return true, result
 end

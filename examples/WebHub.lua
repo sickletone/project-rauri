@@ -5,10 +5,16 @@
 --   node scripts/bundle.mjs --entry src/shared/Rauri/init.lua \
 --     --out dist/rauri.lua --alias ReplicatedStorage=src/shared
 --
--- In a Roblox executor:
---   local Rauri = loadstring(game:HttpGet("<url to rauri.lua>"))()
---   local buildHub = loadstring(game:HttpGet("<url to WebHub.lua>"))()
+-- In a Roblox executor, load the published build and this file:
+--   local Rauri = loadstring(game:HttpGet(
+--     "https://raw.githubusercontent.com/sickletone/project-rauri/main/dist/rauri.lua"
+--   ))()
+--   local buildHub = loadstring(game:HttpGet(
+--     "https://raw.githubusercontent.com/sickletone/project-rauri/main/examples/WebHub.lua"
+--   ))()
 --   buildHub(Rauri)
+--
+-- Or run examples/WebHubLoader.lua once and skip both steps.
 --
 -- Every part of this is replaceable: drop the default chrome (chrome = false),
 -- write your own HTML/CSS, swap the theme, add commands or use the DOM from
