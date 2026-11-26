@@ -113,7 +113,7 @@ The full supported subset and API are in [docs/WEB.md](docs/WEB.md); `examples/W
 
 ### Builder site
 
-`site/` is a static landing page with a visual interface builder. Drag frames, text, buttons, inputs and images on a 720x420 grid, edit position, size, colors and text, then export the HTML and CSS with a Lua wrapper. It has no build step and no dependencies; open `site/index.html` or serve the folder:
+`site/index.html` is the landing page and `site/editor.html` is a visual interface builder. Drag frames, text, buttons, inputs and images on a 720x420 grid, edit position, size, colors and text, then export the HTML and CSS with a Lua wrapper. The site has no build step and no dependencies; its interface icons are Lucide SVGs. Open `site/index.html` or serve the folder:
 
 ```bash
 cd site && python3 -m http.server 4173
